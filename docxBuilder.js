@@ -1,4 +1,24 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType } from 'docx';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType, ImageRun, AlignmentType } from 'docx';
+import sizeOf from 'image-size';
+
+const MAX_IMG_WIDTH = 460; // px in the resulting docx
+
+function imageParagraph(buffer) {
+  let width = MAX_IMG_WIDTH, height = MAX_IMG_WIDTH * 0.6;
+  try {
+    const dim = sizeOf(buffer);
+    if (dim.width && dim.height) {
+      width = Math.min(MAX_IMG_WIDTH, dim.width);
+      height = Math.round(width * (dim.height / dim.width));
+    }
+  } catch { /* fall back to default box if dimensions can't be read */ }
+
+  return new Paragraph({
+    alignment: AlignmentType.CENTER,
+    spacing: { before: 120, after: 200 },
+    children: [ new ImageRun({ type: 'jpg', data: buffer, transformation: { width, height } }) ]
+  });
+}
 
 // Splits text on {{...}} markers and returns an array of TextRun,
 // highlighting the marked (low-confidence) fragments.
@@ -44,6 +64,9 @@ export async function buildDocx(pageResults) {
   pageResults.forEach((page, idx) => {
     for (const block of page.blocks) {
       children.push(...blockToParagraphs(block));
+    }
+    for (const imgBuf of (page.images || [])) {
+      children.push(imageParagraph(imgBuf));
     }
     if (idx < pageResults.length - 1) {
       children.push(new Paragraph({ children: [new PageBreak()] }));

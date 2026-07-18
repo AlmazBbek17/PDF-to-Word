@@ -15,6 +15,7 @@ const execFileAsync = promisify(execFile);
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -37,12 +38,40 @@ app.post('/page-count', upload.single('file'), async (req, res) => {
   }
 });
 
-// Renders every page of a PDF buffer to PNG bytes using poppler's pdftoppm.
-// Returns an array of Buffer, one per page, in order (page 1 first).
-async function renderPdfPages(pdfBuffer) {
-  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
-  const pdfPath = path.join(tmpDir, 'input.pdf');
-  await fs.writeFile(pdfPath, pdfBuffer);
+// Real, low-resolution page thumbnails for the page-picker screen — fast,
+// separate from the higher-res render used for the actual Claude vision call.
+app.post('/page-preview', upload.single('file'), async (req, res) => {
+  let tmpDir;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-preview-'));
+    const pdfPath = path.join(tmpDir, 'input.pdf');
+    await fs.writeFile(pdfPath, req.file.buffer);
+    const prefix = path.join(tmpDir, 'p');
+    await execFileAsync('pdftoppm', ['-jpeg', '-r', '70', pdfPath, prefix]);
+    const files = (await fs.readdir(tmpDir))
+      .filter(f => f.startsWith('p') && f.endsWith('.jpg'))
+      .sort((a, b) => {
+        const na = parseInt(a.match(/-(\d+)\.jpg$/)?.[1] || '0', 10);
+        const nb = parseInt(b.match(/-(\d+)\.jpg$/)?.[1] || '0', 10);
+        return na - nb;
+      });
+    const pages = [];
+    for (const f of files) {
+      const buf = await fs.readFile(path.join(tmpDir, f));
+      pages.push(buf.toString('base64'));
+    }
+    res.json({ pages });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Could not render preview' });
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// Renders every page of a PDF to JPEG (for the Claude vision call) inside
+// the given tmpDir, which the caller is responsible for cleaning up.
+async function renderPdfPagesInto(tmpDir, pdfPath) {
   const prefix = path.join(tmpDir, 'page');
   await execFileAsync('pdftoppm', ['-jpeg', '-r', '150', pdfPath, prefix]);
   const files = (await fs.readdir(tmpDir))
@@ -54,8 +83,22 @@ async function renderPdfPages(pdfBuffer) {
     });
   const buffers = [];
   for (const f of files) buffers.push(await fs.readFile(path.join(tmpDir, f)));
-  await fs.rm(tmpDir, { recursive: true, force: true });
   return buffers;
+}
+
+// Extracts embedded raster images (logos, photos) that live on one specific
+// page of the PDF, as real binary JPEGs — no model involved, no hallucination risk.
+async function extractPageImages(tmpDir, pdfPath, pageNum) {
+  const prefix = path.join(tmpDir, `pgimg-${pageNum}`);
+  try {
+    await execFileAsync('pdfimages', ['-j', '-f', String(pageNum), '-l', String(pageNum), pdfPath, prefix]);
+  } catch {
+    return [];
+  }
+  const files = (await fs.readdir(tmpDir)).filter(f => f.startsWith(`pgimg-${pageNum}-`));
+  const bufs = [];
+  for (const f of files) bufs.push(await fs.readFile(path.join(tmpDir, f)));
+  return bufs;
 }
 
 const PAGE_PROMPT = `You are converting a scanned or digital document page into structured content for a Word document.
@@ -75,7 +118,8 @@ Rules:
 - Use "heading" only for real section titles, not for emphasis.
 - For any word or number you are not confident about (blurry, cut off, ambiguous), wrap ONLY that fragment in double curly braces, e.g. "the total is {{4,850.00}}". Do not wrap text you are confident about.
 - Never invent text that is not visibly present on the page.
-- If the page is blank or has no extractable content, return {"blocks": []}.
+- Do NOT describe or transcribe photos/illustrations/logos — those are handled separately. Only transcribe actual text and tables.
+- If the page is blank or has no extractable text, return {"blocks": []}.
 - Do not include page numbers, headers/footers that just repeat, as separate noise blocks unless they carry real information.`;
 
 async function parsePageWithClaude(imageBuffer) {
@@ -101,11 +145,16 @@ async function parsePageWithClaude(imageBuffer) {
 }
 
 app.post('/convert', upload.single('file'), async (req, res) => {
+  let tmpDir;
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
 
-    const pageImages = await renderPdfPages(req.file.buffer);
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
+    const pdfPath = path.join(tmpDir, 'input.pdf');
+    await fs.writeFile(pdfPath, req.file.buffer);
+
+    const pageImages = await renderPdfPagesInto(tmpDir, pdfPath);
     if (pageImages.length === 0) return res.status(422).json({ error: 'Could not render any pages from this PDF' });
 
     let indices = pageImages.map((_, i) => i);
@@ -117,8 +166,12 @@ app.post('/convert', upload.single('file'), async (req, res) => {
 
     const pageResults = [];
     for (const i of indices) {
-      const parsed = await parsePageWithClaude(pageImages[i]);
-      pageResults.push({ pageNumber: i + 1, blocks: parsed.blocks || [] });
+      const pageNumber = i + 1;
+      const [parsed, images] = await Promise.all([
+        parsePageWithClaude(pageImages[i]),
+        extractPageImages(tmpDir, pdfPath, pageNumber)
+      ]);
+      pageResults.push({ pageNumber, blocks: parsed.blocks || [], images });
     }
 
     const docxBuffer = await buildDocx(pageResults);
@@ -130,6 +183,8 @@ app.post('/convert', upload.single('file'), async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Conversion failed' });
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
