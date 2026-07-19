@@ -29,3 +29,26 @@ export function requireAuth(req, res, next) {
     res.status(401).json({ error: 'Invalid or expired session' });
   }
 }
+
+// Used by routes that should work BOTH for signed-in paying users (Bearer session
+// token) and for brand-new anonymous visitors still on their free 10 pages
+// (X-Anonymous-Id header, no sign-in required). Attaches req.userEmail OR req.anonId.
+export function identifyQuotaSubject(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    try {
+      const decoded = jwt.verify(token, process.env.SESSION_JWT_SECRET);
+      req.userEmail = decoded.email;
+      return next();
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired session' });
+    }
+  }
+  const anonId = req.headers['x-anonymous-id'];
+  if (anonId) {
+    req.anonId = String(anonId);
+    return next();
+  }
+  res.status(400).json({ error: 'Missing session token or X-Anonymous-Id header' });
+}

@@ -9,8 +9,8 @@ import path from 'path';
 import os from 'os';
 import Anthropic from '@anthropic-ai/sdk';
 import { buildDocx } from './docxBuilder.js';
-import { initDb, findOrCreateUser, getUserByEmail, incrementUsage } from './db.js';
-import { verifyGoogleAccessToken, issueSessionToken, requireAuth } from './auth.js';
+import { initDb, pool, FREE_PAGES, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
+import { verifyGoogleAccessToken, issueSessionToken, requireAuth, identifyQuotaSubject } from './auth.js';
 import { createCheckoutSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
 
 dotenv.config();
@@ -27,13 +27,25 @@ const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Resolves the DB row for either a signed-in user (req.userEmail, set by
+// identifyQuotaSubject/requireAuth) or an anonymous free-tier visitor (req.anonId).
+// Returns null if no Postgres is attached — callers should treat that as "quota not tracked".
+async function resolveQuotaUser(req) {
+  if (!pool) return null;
+  if (req.userEmail) return getUserByEmail(req.userEmail);
+  if (req.anonId) return findOrCreateAnonUser(req.anonId);
+  return null;
+}
+
 // ---------- Auth ----------
+// Called only when the person actually starts a payment (hidden behind the
+// "Оплатить" button) — never a separate, visible sign-in step.
 app.post('/auth/google', express.json(), async (req, res) => {
   try {
-    const { access_token } = req.body;
+    const { access_token, anonymous_id } = req.body;
     if (!access_token) return res.status(400).json({ error: 'Missing access_token' });
     const { email, sub } = await verifyGoogleAccessToken(access_token);
-    const user = await findOrCreateUser({ email, googleSub: sub });
+    const user = await findOrCreateUserFromGoogle({ email, googleSub: sub, anonId: anonymous_id });
     const token = issueSessionToken(email);
     res.json({ token, email: user.email, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
   } catch (err) {
@@ -46,6 +58,17 @@ app.get('/me', requireAuth, async (req, res) => {
   const user = await getUserByEmail(req.userEmail);
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({ email: user.email, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
+});
+
+// Lightweight quota check for BOTH signed-in and anonymous free-tier users —
+// used to show the "N / M free" pill and to decide whether to show the paywall.
+app.get('/quota', identifyQuotaSubject, async (req, res) => {
+  const user = await resolveQuotaUser(req);
+  if (!user) {
+    if (!pool) return res.json({ signed_in: !!req.userEmail, plan: 'free', pages_limit: FREE_PAGES, pages_used: 0, tracked: false });
+    return res.status(404).json({ error: 'User not found' });
+  }
+  res.json({ signed_in: !!req.userEmail, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
 });
 
 // ---------- Billing ----------
@@ -80,6 +103,7 @@ app.post('/webhooks/dodo', express.raw({ type: 'application/json' }), async (req
   }
 });
 
+// ---------- PDF utilities (no quota needed — cheap, no Claude calls) ----------
 app.post('/page-count', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
@@ -95,8 +119,6 @@ app.post('/page-count', upload.single('file'), async (req, res) => {
   }
 });
 
-// Real, low-resolution page thumbnails for the page-picker screen — fast,
-// separate from the higher-res render used for the actual Claude vision call.
 app.post('/page-preview', upload.single('file'), async (req, res) => {
   let tmpDir;
   try {
@@ -126,8 +148,6 @@ app.post('/page-preview', upload.single('file'), async (req, res) => {
   }
 });
 
-// Renders every page of a PDF to JPEG (for the Claude vision call) inside
-// the given tmpDir, which the caller is responsible for cleaning up.
 async function renderPdfPagesInto(tmpDir, pdfPath) {
   const prefix = path.join(tmpDir, 'page');
   await execFileAsync('pdftoppm', ['-jpeg', '-r', '150', pdfPath, prefix]);
@@ -143,8 +163,6 @@ async function renderPdfPagesInto(tmpDir, pdfPath) {
   return buffers;
 }
 
-// Extracts embedded raster images (logos, photos) that live on one specific
-// page of the PDF, as real binary JPEGs — no model involved, no hallucination risk.
 async function extractPageImages(tmpDir, pdfPath, pageNum) {
   const prefix = path.join(tmpDir, `pgimg-${pageNum}`);
   try {
@@ -201,14 +219,18 @@ async function parsePageWithClaude(imageBuffer) {
   }
 }
 
-app.post('/convert', requireAuth, upload.single('file'), async (req, res) => {
+// Works for both anonymous free-tier visitors (X-Anonymous-Id header) and
+// signed-in paying users (Bearer session token) — identifyQuotaSubject picks whichever is present.
+app.post('/convert', identifyQuotaSubject, upload.single('file'), async (req, res) => {
   let tmpDir;
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
 
-    const user = await getUserByEmail(req.userEmail);
-    if (!user) return res.status(404).json({ error: 'User not found' });
+    const user = await resolveQuotaUser(req);
+    if (!user && pool) return res.status(404).json({ error: 'User not found' });
+    // user === null && !pool means no Postgres attached yet — quota isn't tracked,
+    // conversion proceeds unmetered (useful while you're still setting up billing).
 
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
     const pdfPath = path.join(tmpDir, 'input.pdf');
@@ -224,14 +246,16 @@ app.post('/convert', requireAuth, upload.single('file'), async (req, res) => {
       if (filtered.length) indices = filtered;
     }
 
-    const remaining = user.pages_limit - user.pages_used;
-    if (indices.length > remaining) {
-      return res.status(402).json({
-        error: 'quota_exceeded',
-        message: `Недостаточно страниц в лимите: нужно ${indices.length}, осталось ${Math.max(remaining, 0)}`,
-        pages_limit: user.pages_limit,
-        pages_used: user.pages_used,
-      });
+    if (user) {
+      const remaining = user.pages_limit - user.pages_used;
+      if (indices.length > remaining) {
+        return res.status(402).json({
+          error: 'quota_exceeded',
+          message: `Недостаточно страниц в лимите: нужно ${indices.length}, осталось ${Math.max(remaining, 0)}`,
+          pages_limit: user.pages_limit,
+          pages_used: user.pages_used,
+        });
+      }
     }
 
     const pageResults = [];
@@ -245,7 +269,7 @@ app.post('/convert', requireAuth, upload.single('file'), async (req, res) => {
     }
 
     const docxBuffer = await buildDocx(pageResults);
-    await incrementUsage(req.userEmail, indices.length);
+    if (user) await incrementUsageById(user.id, indices.length);
 
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     res.setHeader('Content-Disposition', `attachment; filename="converted.docx"`);
