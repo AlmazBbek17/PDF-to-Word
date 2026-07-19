@@ -13,10 +13,14 @@
     "@anthropic-ai/sdk": "^0.111.0",
     "cors": "^2.8.6",
     "docx": "^9.7.1",
+    "dodopayments": "^2.42.2",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "image-size": "^2.0.2",
-    "multer": "^2.2.0"
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.2.0",
+    "pg": "^8.22.0",
+    "standardwebhooks": "^1.0.0"
   },
   "type": "module"
 }
