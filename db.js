@@ -23,9 +23,34 @@ export async function initDb() {
       dodo_customer_id TEXT,
       dodo_subscription_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      CONSTRAINT email_or_anon CHECK (email IS NOT NULL OR anon_id IS NOT NULL)
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+  `);
+
+  // Migration for tables created by an earlier version of this schema (email NOT
+  // NULL, no anon_id) — CREATE TABLE IF NOT EXISTS above is a no-op on those, so
+  // bring them up to date explicitly. Every statement here is safe to re-run.
+  await pool.query(`ALTER TABLE users ALTER COLUMN email DROP NOT NULL;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS anon_id TEXT;`);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'users_anon_id_key'
+      ) THEN
+        ALTER TABLE users ADD CONSTRAINT users_anon_id_key UNIQUE (anon_id);
+      END IF;
+    END $$;
+  `);
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'email_or_anon'
+      ) THEN
+        ALTER TABLE users ADD CONSTRAINT email_or_anon CHECK (email IS NOT NULL OR anon_id IS NOT NULL);
+      END IF;
+    END $$;
   `);
 }
 
