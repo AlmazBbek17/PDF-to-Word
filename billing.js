@@ -2,10 +2,32 @@ import DodoPayments from 'dodopayments';
 import { Webhook } from 'standardwebhooks';
 import { PLANS, activatePlan, deactivatePlan, findUserByDodoCustomerId, setDodoCustomerId } from './db.js';
 
-const dodo = new DodoPayments({
-  bearerToken: process.env.DODO_PAYMENTS_API_KEY,
-  environment: process.env.DODO_PAYMENTS_ENVIRONMENT || 'test_mode',
-});
+// Created lazily (not at import time) so a missing DODO_PAYMENTS_API_KEY / DODO_WEBHOOK_SECRET
+// doesn't crash the whole server on boot — only the billing endpoints that actually need them fail.
+let _dodo = null;
+function getDodoClient() {
+  if (!process.env.DODO_PAYMENTS_API_KEY) {
+    throw new Error('DODO_PAYMENTS_API_KEY is not set — billing is not configured on this server');
+  }
+  if (!_dodo) {
+    _dodo = new DodoPayments({
+      bearerToken: process.env.DODO_PAYMENTS_API_KEY,
+      environment: process.env.DODO_PAYMENTS_ENVIRONMENT || 'test_mode',
+    });
+  }
+  return _dodo;
+}
+
+let _webhook = null;
+function getWebhookVerifier() {
+  if (!process.env.DODO_WEBHOOK_SECRET) {
+    throw new Error('DODO_WEBHOOK_SECRET is not set — webhook verification is not configured on this server');
+  }
+  if (!_webhook) {
+    _webhook = new Webhook(process.env.DODO_WEBHOOK_SECRET);
+  }
+  return _webhook;
+}
 
 // Maps our internal plan keys to the product IDs you create in the Dodo dashboard.
 // Set these as env vars once you've created the three subscription products there.
@@ -20,7 +42,7 @@ export async function createCheckoutSession({ email, planKey, returnUrl }) {
   const productId = PRODUCT_ID_BY_PLAN[planKey];
   if (!productId) throw new Error(`No Dodo product configured for ${planKey} — set the matching env var`);
 
-  const session = await dodo.checkoutSessions.create({
+  const session = await getDodoClient().checkoutSessions.create({
     product_cart: [{ product_id: productId, quantity: 1 }],
     customer: { email },
     return_url: returnUrl,
@@ -29,15 +51,13 @@ export async function createCheckoutSession({ email, planKey, returnUrl }) {
   return session.checkout_url;
 }
 
-const webhook = new Webhook(process.env.DODO_WEBHOOK_SECRET);
-
 export async function verifyAndParseWebhook(rawBody, headers) {
   const webhookHeaders = {
     'webhook-id': headers['webhook-id'] || '',
     'webhook-signature': headers['webhook-signature'] || '',
     'webhook-timestamp': headers['webhook-timestamp'] || '',
   };
-  return webhook.verify(rawBody, webhookHeaders); // throws if invalid
+  return getWebhookVerifier().verify(rawBody, webhookHeaders); // throws if invalid
 }
 
 // Reverse-lookup which of our plan keys a Dodo product_id corresponds to.
