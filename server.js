@@ -149,6 +149,48 @@ app.post('/page-preview', upload.single('file'), async (req, res) => {
   }
 });
 
+// Returns a standalone PDF containing only the requested pages, in the given
+// order — used so the "original" pane in the compare screen shows exactly
+// what was selected, not the whole uploaded file.
+app.post('/extract-pages', upload.single('file'), async (req, res) => {
+  let tmpDir;
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!req.body.pages) return res.status(400).json({ error: 'Missing pages param' });
+    const pageNums = String(req.body.pages).split(',').map(n => parseInt(n.trim(), 10)).filter(n => n > 0);
+    if (!pageNums.length) return res.status(400).json({ error: 'No valid page numbers' });
+
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-extract-'));
+    const pdfPath = path.join(tmpDir, 'input.pdf');
+    await fs.writeFile(pdfPath, req.file.buffer);
+
+    const sepDir = path.join(tmpDir, 'sep');
+    await fs.mkdir(sepDir);
+    await execFileAsync('pdfseparate', [pdfPath, path.join(sepDir, 'page-%d.pdf')]);
+
+    const orderedPaths = pageNums.map(n => path.join(sepDir, `page-${n}.pdf`));
+    for (const p of orderedPaths) {
+      try { await fs.access(p); } catch { return res.status(400).json({ error: `Page ${p} out of range` }); }
+    }
+
+    const outPath = path.join(tmpDir, 'selected.pdf');
+    if (orderedPaths.length === 1) {
+      await fs.copyFile(orderedPaths[0], outPath);
+    } else {
+      await execFileAsync('pdfunite', [...orderedPaths, outPath]);
+    }
+
+    const outBuffer = await fs.readFile(outPath);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.send(outBuffer);
+  } catch (err) {
+    console.error('extract-pages error', err);
+    res.status(500).json({ error: err.message || 'Could not extract pages' });
+  } finally {
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
 async function renderPdfPagesInto(tmpDir, pdfPath) {
   const prefix = path.join(tmpDir, 'page');
   await execFileAsync('pdftoppm', ['-jpeg', '-r', '150', pdfPath, prefix]);
