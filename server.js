@@ -282,16 +282,28 @@ Look at the page image and return ONLY valid JSON (no markdown fences, no commen
 
 {
   "blocks": [
-    { "type": "heading", "text": "..." },
-    { "type": "paragraph", "text": "..." },
+    { "type": "heading", "text": "...", "align": "left" },
+    { "type": "paragraph", "text": "...", "align": "left" },
+    { "type": "boxed", "text": "...", "align": "left" },
     { "type": "table", "rows": [["cell","cell"], ["cell","cell"]] }
   ]
 }
 
+Block types:
+- "heading": a real section title, not just emphasized text.
+- "paragraph": normal body text.
+- "boxed": text that visually sits inside a drawn rectangle/border on the page but is NOT part of a table (e.g. a stamped box, a signature block, a bordered note, an address block in a frame). Use this whenever you see a rectangle drawn around a piece of text that isn't a table grid.
+- "table": an actual grid with multiple rows and columns of data.
+
+Alignment ("align" field, on "heading", "paragraph" and "boxed" blocks):
+- "left" (default) — normal body text.
+- "center" — centered text, e.g. titles, centered signatures.
+- "right" — text visibly aligned to the right margin, e.g. a form header, date, or reference block positioned at the top-right of the page.
+- Look at the actual horizontal position of the text block on the page to decide this — don't default to "left" if the text is clearly shifted right or centered.
+
 Rules:
 - Preserve the original language of the document exactly — do not translate.
-- Preserve reading order top to bottom.
-- Use "heading" only for real section titles, not for emphasis.
+- Preserve reading order top to bottom, left to right within a line/row.
 - For any word or number you are not confident about (blurry, cut off, ambiguous), wrap ONLY that fragment in double curly braces, e.g. "the total is {{4,850.00}}". Do not wrap text you are confident about.
 - Never invent text that is not visibly present on the page.
 - Do NOT describe or transcribe photos/illustrations/logos — those are handled separately. Only transcribe actual text and tables.

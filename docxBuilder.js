@@ -1,7 +1,23 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType, ImageRun, AlignmentType } from 'docx';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType, ImageRun, AlignmentType, BorderStyle } from 'docx';
 import sizeOf from 'image-size';
 
 const MAX_IMG_WIDTH = 460; // px in the resulting docx
+
+const ALIGN_MAP = { left: AlignmentType.LEFT, center: AlignmentType.CENTER, right: AlignmentType.RIGHT };
+function resolveAlign(align) {
+  return ALIGN_MAP[align] || AlignmentType.LEFT;
+}
+
+// A thin single-line border on all four sides, with some breathing room
+// between the text and the border — for text that visually sits inside a
+// drawn box on the original page but isn't a table (stamps, signature
+// blocks, bordered notes).
+const BOXED_BORDER = {
+  top:    { style: BorderStyle.SINGLE, size: 6, color: '444444', space: 8 },
+  bottom: { style: BorderStyle.SINGLE, size: 6, color: '444444', space: 8 },
+  left:   { style: BorderStyle.SINGLE, size: 6, color: '444444', space: 8 },
+  right:  { style: BorderStyle.SINGLE, size: 6, color: '444444', space: 8 },
+};
 
 function imageParagraph(buffer) {
   let width = MAX_IMG_WIDTH, height = MAX_IMG_WIDTH * 0.6;
@@ -35,10 +51,26 @@ function runsForText(text) {
 
 function blockToParagraphs(block) {
   if (block.type === 'heading') {
-    return [new Paragraph({ heading: HeadingLevel.HEADING_2, children: runsForText(block.text || '') })];
+    return [new Paragraph({
+      heading: HeadingLevel.HEADING_2,
+      alignment: resolveAlign(block.align),
+      children: runsForText(block.text || '')
+    })];
   }
   if (block.type === 'paragraph') {
-    return [new Paragraph({ spacing: { after: 160 }, children: runsForText(block.text || '') })];
+    return [new Paragraph({
+      spacing: { after: 160 },
+      alignment: resolveAlign(block.align),
+      children: runsForText(block.text || '')
+    })];
+  }
+  if (block.type === 'boxed') {
+    return [new Paragraph({
+      spacing: { after: 160, before: 40 },
+      alignment: resolveAlign(block.align),
+      border: BOXED_BORDER,
+      children: runsForText(block.text || '')
+    })];
   }
   if (block.type === 'table' && Array.isArray(block.rows) && block.rows.length) {
     const colCount = Math.max(...block.rows.map(r => r.length));
