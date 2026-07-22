@@ -7,6 +7,7 @@ import { promisify } from 'util';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { buildDocx } from './docxBuilder.js';
 import { ocrPage } from './ocr.js';
@@ -347,23 +348,38 @@ async function parsePageWithClaude(imageBuffer, ocrText) {
 
 // Works for both anonymous free-tier visitors (X-Anonymous-Id header) and
 // signed-in paying users (Bearer session token) — identifyQuotaSubject picks whichever is present.
-app.post('/convert', identifyQuotaSubject, upload.single('file'), async (req, res) => {
-  let tmpDir;
+// In-memory job store — fine for a single-instance Railway deploy (no queue/
+// Redis needed at this scale). Job state is lost on server restart, which is
+// an acceptable tradeoff here: a mid-conversion restart is rare and the
+// person can just retry.
+const jobs = new Map();
+const JOB_TTL_MS = 15 * 60 * 1000; // clean up unclaimed jobs after 15 min
+
+function cleanupOldJobs() {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id);
+  }
+}
+setInterval(cleanupOldJobs, 5 * 60 * 1000).unref();
+
+app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
 
     const user = await resolveQuotaUser(req);
     if (!user && pool) return res.status(404).json({ error: 'User not found' });
-    // user === null && !pool means no Postgres attached yet — quota isn't tracked,
-    // conversion proceeds unmetered (useful while you're still setting up billing).
 
-    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
     const pdfPath = path.join(tmpDir, 'input.pdf');
     await fs.writeFile(pdfPath, req.file.buffer);
 
     const { buffers: pageImages, filePaths: pageImagePaths } = await renderPdfPagesInto(tmpDir, pdfPath);
-    if (pageImages.length === 0) return res.status(422).json({ error: 'Could not render any pages from this PDF' });
+    if (pageImages.length === 0) {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      return res.status(422).json({ error: 'Could not render any pages from this PDF' });
+    }
 
     let indices = pageImages.map((_, i) => i);
     if (req.body.pages) {
@@ -375,6 +391,7 @@ app.post('/convert', identifyQuotaSubject, upload.single('file'), async (req, re
     if (user) {
       const remaining = user.pages_limit - user.pages_used;
       if (indices.length > remaining) {
+        await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         return res.status(402).json({
           error: 'quota_exceeded',
           message: `Недостаточно страниц в лимите: нужно ${indices.length}, осталось ${Math.max(remaining, 0)}`,
@@ -384,9 +401,38 @@ app.post('/convert', identifyQuotaSubject, upload.single('file'), async (req, re
       }
     }
 
+    const jobId = crypto.randomUUID();
+    jobs.set(jobId, {
+      status: 'processing',
+      stage: 'text',           // 'text' | 'tables' | 'images' | 'building' | 'done'
+      pagesDone: 0,
+      pagesTotal: indices.length,
+      resultBuffer: null,
+      pagesConverted: indices.length,
+      error: null,
+      createdAt: Date.now(),
+    });
+    res.json({ job_id: jobId, pages_total: indices.length });
+
+    // Runs after the response is already sent — the client polls /convert/progress.
+    runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, user, userEmail: req.userEmail }).catch(err => {
+      console.error('conversion job failed', err);
+      const job = jobs.get(jobId);
+      if (job) { job.status = 'error'; job.error = err.message || 'Conversion failed'; }
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not start conversion' });
+  }
+});
+
+async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, user, userEmail }) {
+  const job = jobs.get(jobId);
+  try {
     const pageResults = [];
     for (const i of indices) {
       const pageNumber = i + 1;
+      job.stage = 'text';
       const scanned = await isScannedPage(pdfPath, pageNumber);
       let ocrText = null;
       if (scanned) {
@@ -397,26 +443,50 @@ app.post('/convert', identifyQuotaSubject, upload.single('file'), async (req, re
           console.error(`OCR failed for page ${pageNumber}`, err.message);
         }
       }
+      job.stage = 'tables';
       const [parsed, images] = await Promise.all([
         parsePageWithClaude(pageImages[i], ocrText),
         extractPageImages(tmpDir, pdfPath, pageNumber)
       ]);
       pageResults.push({ pageNumber, blocks: parsed.blocks || [], images });
+      job.pagesDone += 1; // real, per-page progress — not a time-based estimate
     }
 
+    job.stage = 'building';
     const docxBuffer = await buildDocx(pageResults);
     if (user) await incrementUsageById(user.id, indices.length);
 
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="converted.docx"`);
-    res.setHeader('X-Pages-Converted', String(indices.length));
-    res.send(docxBuffer);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message || 'Conversion failed' });
+    job.resultBuffer = docxBuffer;
+    job.status = 'done';
+    job.stage = 'done';
   } finally {
-    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
+}
+
+app.get('/convert/progress/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  res.json({
+    status: job.status,
+    stage: job.stage,
+    pages_done: job.pagesDone,
+    pages_total: job.pagesTotal,
+    error: job.error,
+  });
+});
+
+app.get('/convert/result/:jobId', (req, res) => {
+  const job = jobs.get(req.params.jobId);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (job.status === 'error') return res.status(500).json({ error: job.error || 'Conversion failed' });
+  if (job.status !== 'done') return res.status(409).json({ error: 'Not ready yet' });
+
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+  res.setHeader('Content-Disposition', `attachment; filename="converted.docx"`);
+  res.setHeader('X-Pages-Converted', String(job.pagesConverted));
+  res.send(job.resultBuffer);
+  jobs.delete(req.params.jobId);
 });
 
 const PORT = process.env.PORT || 3000;
