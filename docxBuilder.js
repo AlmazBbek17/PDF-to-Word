@@ -8,6 +8,14 @@ function resolveAlign(align) {
   return ALIGN_MAP[align] || AlignmentType.LEFT;
 }
 
+// Only non-default alignments need a named style — plain left-aligned text
+// already renders correctly in the preview as a normal paragraph.
+function styleForAlign(align) {
+  if (align === 'right') return 'AlignRight';
+  if (align === 'center') return 'AlignCenter';
+  return undefined;
+}
+
 // A thin single-line border on all four sides, with some breathing room
 // between the text and the border — for text that visually sits inside a
 // drawn box on the original page but isn't a table (stamps, signature
@@ -61,6 +69,7 @@ function blockToParagraphs(block) {
     return [new Paragraph({
       spacing: { after: 160 },
       alignment: resolveAlign(block.align),
+      style: styleForAlign(block.align),
       children: runsForText(block.text || '')
     })];
   }
@@ -69,6 +78,7 @@ function blockToParagraphs(block) {
       spacing: { after: 160, before: 40 },
       alignment: resolveAlign(block.align),
       border: BOXED_BORDER,
+      style: 'BoxedText',
       children: runsForText(block.text || '')
     })];
   }
@@ -114,12 +124,12 @@ export async function buildDocx(pageResults) {
 
   const doc = new Document({
     styles: {
-      paragraphStyles: [{
-        id: 'PageBreakMarker',
-        name: 'Page Break Marker',
-        basedOn: 'Normal',
-        next: 'Normal',
-      }]
+      paragraphStyles: [
+        { id: 'PageBreakMarker', name: 'Page Break Marker', basedOn: 'Normal', next: 'Normal' },
+        { id: 'AlignRight', name: 'Align Right', basedOn: 'Normal', next: 'Normal', paragraph: { alignment: AlignmentType.RIGHT } },
+        { id: 'AlignCenter', name: 'Align Center', basedOn: 'Normal', next: 'Normal', paragraph: { alignment: AlignmentType.CENTER } },
+        { id: 'BoxedText', name: 'Boxed Text', basedOn: 'Normal', next: 'Normal', paragraph: { border: BOXED_BORDER } },
+      ]
     },
     sections: [{ children }]
   });
