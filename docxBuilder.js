@@ -69,7 +69,10 @@ export async function buildDocx(pageResults) {
       children.push(imageParagraph(imgBuf));
     }
     if (idx < pageResults.length - 1) {
-      children.push(new Paragraph({ children: [new PageBreak()] }));
+      // Tagged with a named style (not just a bare page break) so the frontend
+      // preview (via mammoth's styleMap) can detect exactly where pages split
+      // and render the result as separate sheets, matching the original PDF view.
+      children.push(new Paragraph({ style: 'PageBreakMarker', children: [new PageBreak()] }));
     }
   });
 
@@ -77,6 +80,16 @@ export async function buildDocx(pageResults) {
     children.push(new Paragraph({ text: 'Не удалось извлечь содержимое из выбранных страниц.' }));
   }
 
-  const doc = new Document({ sections: [{ children }] });
+  const doc = new Document({
+    styles: {
+      paragraphStyles: [{
+        id: 'PageBreakMarker',
+        name: 'Page Break Marker',
+        basedOn: 'Normal',
+        next: 'Normal',
+      }]
+    },
+    sections: [{ children }]
+  });
   return Packer.toBuffer(doc);
 }
