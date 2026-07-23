@@ -9,7 +9,7 @@
 
 import {
   MathRun, MathFraction, MathRadical, MathSubScript, MathSuperScript,
-  MathSubSuperScript, MathFunction, MathFunctionName, MathSum, MathIntegral,
+  MathSubSuperScript, MathFunction, MathSum, MathIntegral,
   MathRoundBrackets, MathSquareBrackets, MathCurlyBrackets, MathAngledBrackets,
   createMathNAryProperties, createMathBase, createMathSubScriptElement, createMathSuperScriptElement,
 } from 'docx';
@@ -170,7 +170,7 @@ export function parseLatex(latex) {
         if (latex[after] === '{') { const [g, a] = readGroup(latex, after); argEls = parseLatex(g); after = a; }
         else if (after < latex.length) { argEls = [new MathRun(latex[after])]; after++; }
         else argEls = [];
-        elements.push(new MathFunction({ name: [new MathFunctionName({ children: [new MathRun(cmd)] })], children: argEls }));
+        elements.push(new MathFunction({ name: [new MathRun(cmd)], children: argEls }));
         i = after;
       } else if (TEXT_MODE_CMDS.has(cmd)) {
         const [g, a] = readGroup(latex, after);
