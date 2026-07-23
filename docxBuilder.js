@@ -1,5 +1,36 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType, ImageRun, AlignmentType, BorderStyle } from 'docx';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, PageBreak, ShadingType, ImageRun, AlignmentType, BorderStyle, Math as DocxMath, MathRun, MathFraction, MathSubScript, MathSuperScript } from 'docx';
 import sizeOf from 'image-size';
+
+// Converts our formula-token JSON (from the model) into real docx.js Math
+// elements — actual editable Word equations (fractions, subscripts,
+// superscripts), not a flattened text approximation.
+function tokensToMathChildren(tokens) {
+  if (!Array.isArray(tokens)) return [];
+  const out = [];
+  for (const tok of tokens) {
+    if (typeof tok === 'string') {
+      if (tok.length) out.push(new MathRun(tok));
+    } else if (tok && typeof tok === 'object') {
+      if ('sub' in tok) {
+        out.push(new MathSubScript({
+          children: [new MathRun(String(tok.sub ?? ''))],
+          subScript: [new MathRun(String(tok.text ?? ''))],
+        }));
+      } else if ('sup' in tok) {
+        out.push(new MathSuperScript({
+          children: [new MathRun(String(tok.sup ?? ''))],
+          superScript: [new MathRun(String(tok.text ?? ''))],
+        }));
+      } else if (tok.frac) {
+        out.push(new MathFraction({
+          numerator: tokensToMathChildren(tok.frac.num || []),
+          denominator: tokensToMathChildren(tok.frac.den || []),
+        }));
+      }
+    }
+  }
+  return out;
+}
 
 const MAX_IMG_WIDTH = 460; // px in the resulting docx
 
@@ -87,6 +118,15 @@ function blockToParagraphs(block, stats) {
       border: BOXED_BORDER,
       style: 'BoxedText',
       children: runsForText(block.text || '', stats)
+    })];
+  }
+  if (block.type === 'formula') {
+    const mathChildren = tokensToMathChildren(block.tokens);
+    if (mathChildren.length === 0) return [];
+    return [new Paragraph({
+      spacing: { after: 160, before: 80 },
+      alignment: resolveAlign(block.align || 'center'),
+      children: [ new DocxMath({ children: mathChildren }) ]
     })];
   }
   if (block.type === 'table' && Array.isArray(block.rows) && block.rows.length) {

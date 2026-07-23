@@ -293,7 +293,8 @@ Look at the page image and return ONLY valid JSON (no markdown fences, no commen
     { "type": "heading", "text": "...", "align": "left" },
     { "type": "paragraph", "text": "...", "align": "left" },
     { "type": "boxed", "text": "...", "align": "left" },
-    { "type": "table", "rows": [["cell","cell"], ["cell","cell"]] }
+    { "type": "table", "rows": [["cell","cell"], ["cell","cell"]] },
+    { "type": "formula", "tokens": [ FORMULA_TOKEN, ... ], "align": "center" }
   ]
 }
 
@@ -302,10 +303,25 @@ Block types:
 - "paragraph": normal body text.
 - "boxed": text that visually sits inside a drawn rectangle/border on the page but is NOT part of a table (e.g. a stamped box, a signature block, a bordered note, an address block in a frame). Use this whenever you see a rectangle drawn around a piece of text that isn't a table grid.
 - "table": an actual grid with multiple rows and columns of data.
+- "formula": a mathematical or scientific equation typeset with real fractions, subscripts, or superscripts (not just plain inline text like "x^2" or "a_1"). Use this so the equation renders as a real, editable Word equation instead of flattened text.
 
-Alignment ("align" field, on "heading", "paragraph" and "boxed" blocks):
+FORMULA_TOKEN (each item in a formula's "tokens" array) is one of:
+- a plain string — literal text, operators, parentheses, variable names, Greek letters (σ, β, π, etc.), spaces.
+- { "sub": "base", "text": "subscript" } — "base" rendered with "text" as a subscript, e.g. {"sub":"R","text":"f"} for R_f.
+- { "sup": "base", "text": "exponent" } — "base" rendered with "text" as a superscript, e.g. {"sup":"x","text":"2"} for x².
+- { "frac": { "num": [FORMULA_TOKEN, ...], "den": [FORMULA_TOKEN, ...] } } — a real fraction; "num" and "den" are themselves arrays of formula tokens (so they can contain their own subscripts, e.g. a numerator of "E(R_p) - R_f").
+
+Example — the Sharpe Ratio formula S_p = (E(R_p) − R_f) / σ_p becomes:
+{ "type": "formula", "align": "center", "tokens": [
+  { "sub": "S", "text": "p" }, " = ",
+  { "frac": { "num": ["E(R", {"sub":"p","text":""}, ") − R", {"sub":"","text":"f"}], "den": ["σ", {"sub":"","text":"p"}] } }
+] }
+
+Only use "formula" for genuine equations with visual math structure (fractions, sub/superscripts). Plain inline references like "see equation 3" or a bare variable name in running prose stay as normal "paragraph" text.
+
+Alignment ("align" field, on "heading", "paragraph", "boxed", and "formula" blocks):
 - "left" (default) — normal body text.
-- "center" — centered text, e.g. titles, centered signatures.
+- "center" — centered text, e.g. titles, centered signatures, standalone equations.
 - "right" — text visibly aligned to the right margin, e.g. a form header, date, or reference block positioned at the top-right of the page.
 - Look at the actual horizontal position of the text block on the page to decide this — don't default to "left" if the text is clearly shifted right or centered.
 
