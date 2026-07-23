@@ -294,7 +294,7 @@ Look at the page image and return ONLY valid JSON (no markdown fences, no commen
     { "type": "paragraph", "text": "...", "align": "left" },
     { "type": "boxed", "text": "...", "align": "left" },
     { "type": "table", "rows": [["cell","cell"], ["cell","cell"]] },
-    { "type": "formula", "tokens": [ FORMULA_TOKEN, ... ], "align": "center" }
+    { "type": "formula", "latex": "...", "align": "center" }
   ]
 }
 
@@ -305,19 +305,19 @@ Block types:
 - "table": an actual grid with multiple rows and columns of data.
 - "formula": a mathematical or scientific equation typeset with real fractions, subscripts, or superscripts (not just plain inline text like "x^2" or "a_1"). Use this so the equation renders as a real, editable Word equation instead of flattened text.
 
-FORMULA_TOKEN (each item in a formula's "tokens" array) is one of:
-- a plain string — literal text, operators, parentheses, variable names, Greek letters (σ, β, π, etc.), spaces.
-- { "sub": "base", "text": "subscript" } — "base" rendered with "text" as a subscript, e.g. {"sub":"R","text":"f"} for R_f.
-- { "sup": "base", "text": "exponent" } — "base" rendered with "text" as a superscript, e.g. {"sup":"x","text":"2"} for x².
-- { "frac": { "num": [FORMULA_TOKEN, ...], "den": [FORMULA_TOKEN, ...] } } — a real fraction; "num" and "den" are themselves arrays of formula tokens (so they can contain their own subscripts, e.g. a numerator of "E(R_p) - R_f").
+For "formula" blocks, the "latex" field is a standard LaTeX math expression (no surrounding $ or $$ delimiters — just the expression itself). Use normal LaTeX syntax:
+- Fractions: \frac{numerator}{denominator}
+- Subscripts/superscripts: x_1, x^2, x_1^2
+- Square roots: \sqrt{x}, \sqrt[3]{x}
+- Greek letters: \sigma, \beta, \pi, \Delta, etc.
+- Sums/products/integrals with limits: \sum_{i=1}^{n}, \prod_{i=1}^{n}, \int_0^\infty
+- Named functions: \sin, \cos, \log, \ln, \lim, \max, \min
+- Grouping/delimiters: \left( ... \right), \left[ ... \right]
 
 Example — the Sharpe Ratio formula S_p = (E(R_p) − R_f) / σ_p becomes:
-{ "type": "formula", "align": "center", "tokens": [
-  { "sub": "S", "text": "p" }, " = ",
-  { "frac": { "num": ["E(R", {"sub":"p","text":""}, ") − R", {"sub":"","text":"f"}], "den": ["σ", {"sub":"","text":"p"}] } }
-] }
+{ "type": "formula", "align": "center", "latex": "S_p = \\frac{E(R_p) - R_f}{\\sigma_p}" }
 
-Only use "formula" for genuine equations with visual math structure (fractions, sub/superscripts). Plain inline references like "see equation 3" or a bare variable name in running prose stay as normal "paragraph" text.
+Only use "formula" for genuine equations with visual math structure (fractions, sub/superscripts, roots, sums). Plain inline references like "see equation 3" or a bare variable name in running prose stay as normal "paragraph" text.
 
 Alignment ("align" field, on "heading", "paragraph", "boxed", and "formula" blocks):
 - "left" (default) — normal body text.
