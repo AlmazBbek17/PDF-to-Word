@@ -317,7 +317,7 @@ For "formula" blocks, the "latex" field is a standard LaTeX math expression (no 
 Example — the Sharpe Ratio formula S_p = (E(R_p) − R_f) / σ_p becomes:
 { "type": "formula", "align": "center", "latex": "S_p = \\frac{E(R_p) - R_f}{\\sigma_p}" }
 
-Only use "formula" for genuine equations with visual math structure (fractions, sub/superscripts, roots, sums). Plain inline references like "see equation 3" or a bare variable name in running prose stay as normal "paragraph" text.
+Only use a standalone "formula" block for a genuine display equation that sits on its own line. For math that appears INSIDE running prose or a bullet point (e.g. "the weight $w_i$ of asset $i$" or "where $E(R_p)$ is the expected return"), keep it as normal "paragraph"/"heading"/"boxed" text, but wrap just the math part in single dollar signs — $w_i$, $E(R_p)$, $\sum_{i=1}^{n} w_i = 1$ — so it still renders as a real typeset symbol (with subscripts, Greek letters, etc.) instead of flattening to literal text like "w_i" or "E(R_p)". Use the same LaTeX syntax described above inside the $ ... $.
 
 Alignment ("align" field, on "heading", "paragraph", "boxed", and "formula" blocks):
 - "left" (default) — normal body text.

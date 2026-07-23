@@ -172,6 +172,13 @@ export function parseLatex(latex) {
         else argEls = [];
         elements.push(new MathFunction({ name: [new MathRun(cmd)], children: argEls }));
         i = after;
+      } else if (cmd === 'boldsymbol' || cmd === 'bm') {
+        // Bold isn't visually applied (docx.js Math styling for this is more
+        // effort than it's worth right now), but the content is still parsed
+        // as real math — e.g. \boldsymbol{\Sigma} still becomes Σ, not literal text.
+        const [g, a] = readGroup(latex, after);
+        elements.push(...parseLatex(g));
+        i = a;
       } else if (TEXT_MODE_CMDS.has(cmd)) {
         const [g, a] = readGroup(latex, after);
         elements.push(new MathRun(g));

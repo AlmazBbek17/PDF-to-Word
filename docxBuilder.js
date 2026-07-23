@@ -49,20 +49,40 @@ function imageParagraph(buffer) {
 // highlighting the marked (low-confidence) fragments. Also tallies word
 // counts into `stats` so the caller can report a real confidence percentage
 // and a real count of flagged spots — not a placeholder.
+// Splits text on $...$ (inline LaTeX math) and {{...}} (low-confidence
+// markers), returning a mixed array of TextRun and inline Math elements.
+// Also tallies word counts into `stats` for a real confidence percentage.
 function runsForText(text, stats) {
-  const parts = String(text).split(/(\{\{[^{}]*\}\})/g).filter(p => p.length > 0);
-  return parts.map(part => {
-    const m = part.match(/^\{\{([^{}]*)\}\}$/);
-    if (m) {
-      const flaggedWords = m[1].trim().split(/\s+/).filter(Boolean).length;
-      stats.totalWords += flaggedWords;
-      stats.flaggedWords += flaggedWords;
-      stats.flaggedCount += 1;
-      return new TextRun({ text: m[1], shading: { type: ShadingType.CLEAR, fill: 'FCE4C8' }, color: '8A4B0F' });
+  const str = String(text);
+  // Split on $...$ first — inline math can't itself contain a literal "$",
+  // so a non-greedy match between single dollar signs is safe here.
+  const mathSplit = str.split(/(\$[^$]+\$)/g).filter(p => p.length > 0);
+
+  const runs = [];
+  for (const segment of mathSplit) {
+    const mathMatch = segment.match(/^\$([^$]+)\$$/);
+    if (mathMatch) {
+      const mathEls = parseLatex(mathMatch[1]);
+      if (mathEls.length) runs.push(new DocxMath({ children: mathEls }));
+      continue;
     }
-    stats.totalWords += part.trim().split(/\s+/).filter(Boolean).length;
-    return new TextRun(part);
-  });
+    // Plain-text segment — apply the existing {{...}} confidence-flag splitting.
+    const parts = segment.split(/(\{\{[^{}]*\}\})/g).filter(p => p.length > 0);
+    for (const part of parts) {
+      const m = part.match(/^\{\{([^{}]*)\}\}$/);
+      if (m) {
+        const flaggedWords = m[1].trim().split(/\s+/).filter(Boolean).length;
+        stats.totalWords += flaggedWords;
+        stats.flaggedWords += flaggedWords;
+        stats.flaggedCount += 1;
+        runs.push(new TextRun({ text: m[1], shading: { type: ShadingType.CLEAR, fill: 'FCE4C8' }, color: '8A4B0F' }));
+      } else {
+        stats.totalWords += part.trim().split(/\s+/).filter(Boolean).length;
+        runs.push(new TextRun(part));
+      }
+    }
+  }
+  return runs;
 }
 
 function blockToParagraphs(block, stats) {
