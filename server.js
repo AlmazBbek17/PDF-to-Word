@@ -19,7 +19,11 @@ dotenv.config();
 const execFileAsync = promisify(execFile);
 
 const app = express();
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Pages-Converted', 'X-Confidence-Pct', 'X-Flagged-Count'] }));
+
+// Landing page + policy pages (privacy/terms/refund) — served as static files
+// alongside the API, so the marketing site deploys together with the backend.
+app.use(express.static(path.join(process.cwd(), 'public')));
 
 await initDb();
 
@@ -456,10 +460,11 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
     }
 
     job.stage = 'building';
-    const docxBuffer = await buildDocx(pageResults);
+    const { buffer: docxBuffer, stats } = await buildDocx(pageResults);
     if (user) await incrementUsageById(user.id, indices.length);
 
     job.resultBuffer = docxBuffer;
+    job.stats = stats;
     job.status = 'done';
     job.stage = 'done';
   } finally {
@@ -488,6 +493,8 @@ app.get('/convert/result/:jobId', (req, res) => {
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
   res.setHeader('Content-Disposition', `attachment; filename="converted.docx"`);
   res.setHeader('X-Pages-Converted', String(job.pagesConverted));
+  res.setHeader('X-Confidence-Pct', String(job.stats?.confidencePct ?? 100));
+  res.setHeader('X-Flagged-Count', String(job.stats?.flaggedCount ?? 0));
   res.send(job.resultBuffer);
   jobs.delete(req.params.jobId);
 });

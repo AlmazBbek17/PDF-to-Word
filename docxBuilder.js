@@ -45,24 +45,31 @@ function imageParagraph(buffer) {
 }
 
 // Splits text on {{...}} markers and returns an array of TextRun,
-// highlighting the marked (low-confidence) fragments.
-function runsForText(text) {
+// highlighting the marked (low-confidence) fragments. Also tallies word
+// counts into `stats` so the caller can report a real confidence percentage
+// and a real count of flagged spots — not a placeholder.
+function runsForText(text, stats) {
   const parts = String(text).split(/(\{\{[^{}]*\}\})/g).filter(p => p.length > 0);
   return parts.map(part => {
     const m = part.match(/^\{\{([^{}]*)\}\}$/);
     if (m) {
+      const flaggedWords = m[1].trim().split(/\s+/).filter(Boolean).length;
+      stats.totalWords += flaggedWords;
+      stats.flaggedWords += flaggedWords;
+      stats.flaggedCount += 1;
       return new TextRun({ text: m[1], shading: { type: ShadingType.CLEAR, fill: 'FCE4C8' }, color: '8A4B0F' });
     }
+    stats.totalWords += part.trim().split(/\s+/).filter(Boolean).length;
     return new TextRun(part);
   });
 }
 
-function blockToParagraphs(block) {
+function blockToParagraphs(block, stats) {
   if (block.type === 'heading') {
     return [new Paragraph({
       heading: HeadingLevel.HEADING_2,
       alignment: resolveAlign(block.align),
-      children: runsForText(block.text || '')
+      children: runsForText(block.text || '', stats)
     })];
   }
   if (block.type === 'paragraph') {
@@ -70,7 +77,7 @@ function blockToParagraphs(block) {
       spacing: { after: 160 },
       alignment: resolveAlign(block.align),
       style: styleForAlign(block.align),
-      children: runsForText(block.text || '')
+      children: runsForText(block.text || '', stats)
     })];
   }
   if (block.type === 'boxed') {
@@ -79,7 +86,7 @@ function blockToParagraphs(block) {
       alignment: resolveAlign(block.align),
       border: BOXED_BORDER,
       style: 'BoxedText',
-      children: runsForText(block.text || '')
+      children: runsForText(block.text || '', stats)
     })];
   }
   if (block.type === 'table' && Array.isArray(block.rows) && block.rows.length) {
@@ -91,7 +98,7 @@ function blockToParagraphs(block) {
             width: { size: Math.floor(9000 / colCount), type: WidthType.DXA },
             shading: ri === 0 ? { type: ShadingType.CLEAR, fill: 'EEF0F6' } : undefined,
             margins: { top: 80, bottom: 80, left: 100, right: 100 },
-            children: [new Paragraph({ children: runsForText(row[ci] ?? '') })]
+            children: [new Paragraph({ children: runsForText(row[ci] ?? '', stats) })]
           })
         )
       })
@@ -102,10 +109,11 @@ function blockToParagraphs(block) {
 }
 
 export async function buildDocx(pageResults) {
+  const stats = { totalWords: 0, flaggedWords: 0, flaggedCount: 0 };
   const children = [];
   pageResults.forEach((page, idx) => {
     for (const block of page.blocks) {
-      children.push(...blockToParagraphs(block));
+      children.push(...blockToParagraphs(block, stats));
     }
     for (const imgBuf of (page.images || [])) {
       children.push(imageParagraph(imgBuf));
@@ -133,5 +141,11 @@ export async function buildDocx(pageResults) {
     },
     sections: [{ children }]
   });
-  return Packer.toBuffer(doc);
+  const buffer = await Packer.toBuffer(doc);
+
+  const confidencePct = stats.totalWords > 0
+    ? Math.round(((stats.totalWords - stats.flaggedWords) / stats.totalWords) * 100)
+    : 100;
+
+  return { buffer, stats: { ...stats, confidencePct } };
 }
