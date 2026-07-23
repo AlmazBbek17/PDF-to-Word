@@ -77,7 +77,10 @@ app.get('/quota', identifyQuotaSubject, async (req, res) => {
 app.post('/billing/checkout', requireAuth, express.json(), async (req, res) => {
   try {
     const { plan } = req.body;
-    const returnUrl = `${process.env.PUBLIC_BASE_URL}/billing/success`;
+    if (!process.env.PUBLIC_BASE_URL) {
+      throw new Error('Server misconfiguration: PUBLIC_BASE_URL is not set');
+    }
+    const returnUrl = `${process.env.PUBLIC_BASE_URL.replace(/\/$/, '')}/billing/success`;
     const checkoutUrl = await createCheckoutSession({ email: req.userEmail, planKey: plan, returnUrl });
     res.json({ checkout_url: checkoutUrl });
   } catch (err) {
@@ -437,7 +440,7 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
       let ocrText = null;
       if (scanned) {
         try {
-          const ocrResult = await ocrPage(pageImagePaths[i], 'rus+eng');
+          const ocrResult = await ocrPage(pageImagePaths[i]);
           ocrText = ocrResult.rawText;
         } catch (err) {
           console.error(`OCR failed for page ${pageNumber}`, err.message);

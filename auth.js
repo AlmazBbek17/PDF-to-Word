@@ -5,10 +5,16 @@ import jwt from 'jsonwebtoken';
 // Google account). We verify it server-side against Google's tokeninfo endpoint,
 // which also confirms it was issued for our own OAuth client (aud check).
 export async function verifyGoogleAccessToken(accessToken) {
+  if (!process.env.GOOGLE_CLIENT_ID) {
+    throw new Error('Server misconfiguration: GOOGLE_CLIENT_ID is not set on the backend');
+  }
   const res = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${encodeURIComponent(accessToken)}`);
   if (!res.ok) throw new Error('Invalid Google access token');
   const info = await res.json();
-  if (info.aud !== process.env.GOOGLE_CLIENT_ID) throw new Error('Token was not issued for this app');
+  if (info.aud !== process.env.GOOGLE_CLIENT_ID) {
+    console.error(`Google token audience mismatch — token aud="${info.aud}", server GOOGLE_CLIENT_ID="${process.env.GOOGLE_CLIENT_ID}"`);
+    throw new Error('Token was not issued for this app (client ID mismatch)');
+  }
   if (!info.email || info.email_verified !== 'true') throw new Error('Google account email not verified');
   return { email: info.email, sub: info.sub };
 }

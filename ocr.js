@@ -5,9 +5,51 @@ import path from 'path';
 
 const execFileAsync = promisify(execFile);
 
+// All 10 UI languages the extension supports, grouped by script. Combining
+// every language in one OCR pass works but is noticeably slower (~5x) than
+// running only the languages that actually match the page — Tesseract still
+// evaluates every loaded dictionary even when most don't apply. A cheap OSD
+// (script detection) pre-pass lets us pick the right group instead.
+const LATIN_LANGS = 'eng+deu+fra+spa+por+ita+nld'; // en, de, fr, es, pt, it, nl — OSD can't tell these apart
+const SCRIPT_TO_LANGS = {
+  Latin: LATIN_LANGS,
+  Cyrillic: 'rus+eng',
+  Japanese: 'jpn+eng',
+  Han: 'jpn+eng',        // Kanji-heavy pages are usually Japanese in our supported set (no Chinese UI language)
+  Hiragana: 'jpn+eng',
+  Katakana: 'jpn+eng',
+  Korean: 'kor+eng',
+  Hangul: 'kor+eng',
+};
+
+const ALL_LANGS = 'eng+rus+deu+fra+spa+por+ita+nld+jpn+kor';
+
+// Fast (~0.5s) pass that only detects the writing system, not the actual
+// text — used to pick a small, fast language subset for the real OCR pass
+// below instead of always loading all 10 languages (~9s vs ~2-6s).
+// Returns null if OSD couldn't confidently classify the script (common on
+// short or sparse text, e.g. a single header line) — callers should treat
+// null as "unknown", not "Latin", since guessing wrong silently breaks
+// non-Latin scripts (Japanese/Korean/Cyrillic) entirely.
+async function detectScript(imagePath) {
+  try {
+    const { stdout } = await execFileAsync('tesseract', [imagePath, 'stdout', '--psm', '0']);
+    const match = stdout.match(/Script:\s*(\w+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null; // OSD itself failed (e.g. "too few characters") — genuinely unknown
+  }
+}
+
+async function resolveOcrLangs(imagePath) {
+  const script = await detectScript(imagePath);
+  if (!script) return ALL_LANGS; // unknown script — pay the slower full pass rather than guess wrong
+  return SCRIPT_TO_LANGS[script] || LATIN_LANGS;
+}
+
 // Runs Tesseract on a page image and returns word-level bounding boxes.
 // TSV columns: level,page_num,block_num,par_num,line_num,word_num,left,top,width,height,conf,text
-async function ocrWords(imagePath, lang = 'rus+eng') {
+async function ocrWords(imagePath, lang) {
   const { stdout } = await execFileAsync('tesseract', [imagePath, 'stdout', '-l', lang, '--psm', '3', 'tsv']);
   const lines = stdout.split('\n').slice(1); // drop header
   const words = [];
@@ -92,14 +134,17 @@ function median(nums) {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
-// Full pipeline for one scanned page: OCR -> measured paragraphs, plus the
-// raw text (for Claude to clean up wording without re-guessing layout).
-export async function ocrPage(imagePath, lang = 'rus+eng') {
+// Full pipeline for one scanned page: detect script -> OCR with the matching
+// language subset -> measured paragraphs, plus raw text (for Claude to clean
+// up wording without re-guessing layout). Covers all 10 UI languages.
+export async function ocrPage(imagePath) {
+  const lang = await resolveOcrLangs(imagePath);
   const words = await ocrWords(imagePath, lang);
   const paragraphs = groupIntoParagraphs(words);
   return {
     paragraphs,
     rawText: paragraphs.map(p => p.text).join('\n\n'),
     lowConfidenceCount: paragraphs.filter(p => p.avgConf < 60).length,
+    detectedLang: lang,
   };
 }
