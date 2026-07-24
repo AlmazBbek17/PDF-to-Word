@@ -13,7 +13,7 @@ import { buildDocx } from './docxBuilder.js';
 import { ocrPage } from './ocr.js';
 import { initDb, pool, FREE_PAGES, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
 import { verifyGoogleAccessToken, issueSessionToken, requireAuth, identifyQuotaSubject } from './auth.js';
-import { createCheckoutSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
+import { createCheckoutSession, createCustomerPortalSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
 
 dotenv.config();
 const execFileAsync = promisify(execFile);
@@ -90,6 +90,20 @@ app.post('/billing/checkout', requireAuth, express.json(), async (req, res) => {
   } catch (err) {
     console.error('billing/checkout error', err);
     res.status(500).json({ error: err.message || 'Could not start checkout' });
+  }
+});
+
+app.post('/billing/manage', requireAuth, async (req, res) => {
+  try {
+    const user = await getUserByEmail(req.userEmail);
+    if (!user?.dodo_customer_id) {
+      return res.status(404).json({ error: 'No active subscription to manage yet' });
+    }
+    const portalUrl = await createCustomerPortalSession(user.dodo_customer_id);
+    res.json({ portal_url: portalUrl });
+  } catch (err) {
+    console.error('billing/manage error', err);
+    res.status(500).json({ error: err.message || 'Could not open subscription management' });
   }
 });
 
@@ -457,6 +471,20 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
       const pageNumber = i + 1;
       job.stage = 'text';
       const scanned = await isScannedPage(pdfPath, pageNumber);
+
+      if (!scanned) {
+        const layer = await analyzeTextLayer(pdfPath, pageNumber);
+        if (layer.simple) {
+          // Direct extraction — no Claude call at all. Faster, free, and
+          // actually more accurate than the AI path for genuinely plain
+          // text: it's a literal copy, so there's no transcription risk.
+          const images = await extractPageImages(tmpDir, pdfPath, pageNumber);
+          pageResults.push({ pageNumber, blocks: textToParagraphBlocks(layer.text), images });
+          job.pagesDone += 1;
+          continue;
+        }
+      }
+
       let ocrText = null;
       if (scanned) {
         try {

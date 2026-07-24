@@ -51,6 +51,13 @@ export async function createCheckoutSession({ email, planKey, returnUrl }) {
   return session.checkout_url;
 }
 
+// Lets a subscribed customer manage/cancel their subscription directly with
+// Dodo (update card, cancel, view invoices) without us building any of that UI.
+export async function createCustomerPortalSession(dodoCustomerId) {
+  const session = await getDodoClient().customers.customerPortal.create(dodoCustomerId);
+  return session.link;
+}
+
 export async function verifyAndParseWebhook(rawBody, headers) {
   const webhookHeaders = {
     'webhook-id': headers['webhook-id'] || '',
