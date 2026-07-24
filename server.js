@@ -432,6 +432,7 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
         return res.status(402).json({
           error: 'quota_exceeded',
           message: `Недостаточно страниц в лимите: нужно ${indices.length}, осталось ${Math.max(remaining, 0)}`,
+          pages_needed: indices.length,
           pages_limit: user.pages_limit,
           pages_used: user.pages_used,
         });
