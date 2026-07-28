@@ -411,7 +411,7 @@ async function parsePageWithClaude(imageBuffer, ocrText) {
 // an acceptable tradeoff here: a mid-conversion restart is rare and the
 // person can just retry.
 const jobs = new Map();
-const JOB_TTL_MS = 15 * 60 * 1000; // clean up unclaimed jobs after 15 min
+const JOB_TTL_MS = 6 * 60 * 60 * 1000; // clean up unclaimed jobs after 6 hours — long enough that someone can genuinely walk away and come back for a slow conversion
 
 function cleanupOldJobs() {
   const now = Date.now();
@@ -486,6 +486,16 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
     const fastNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'fast').length;
     const editableNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'editable').length;
 
+    // Grounded in real production timing (~20-22s/page observed for actual
+    // Claude vision calls in earlier logs) — not a guess. Free/image pages
+    // are near-instant since no API call happens for them at all.
+    const estimatedSeconds = Object.values(pageOutcomes).reduce((sum, o) => {
+      if (o.action === 'claude-scan') return sum + 23; // OCR pass adds a couple seconds on top of the vision call
+      if (o.action === 'claude') return sum + 20;
+      if (o.action === 'image') return sum + 1;
+      return sum + 0.5; // fast-text — just a pdftotext read
+    }, 0);
+
     if (user) {
       const fastRemaining = user.fast_limit - user.fast_used;
       const editableRemaining = user.editable_limit - user.editable_used;
@@ -509,10 +519,12 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
       resultBuffer: null,
       pagesConverted: indices.length,
       modeCounts: { fast: fastNeeded, editable: editableNeeded },
+      estimatedSeconds,
+      startedAt: Date.now(),
       error: null,
       createdAt: Date.now(),
     });
-    res.json({ job_id: jobId, pages_total: indices.length });
+    res.json({ job_id: jobId, pages_total: indices.length, estimated_seconds: estimatedSeconds });
 
     // Runs after the response is already sent — the client polls /convert/progress.
     runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageOutcomes, user, userEmail: req.userEmail }).catch(err => {
@@ -589,11 +601,27 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
 app.get('/convert/progress/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
+
+  // Once real pages have completed, the actual observed pace is a better
+  // remaining-time estimate than the static upfront guess — blend toward it.
+  let secondsRemaining = null;
+  if (job.status === 'processing') {
+    const elapsed = (Date.now() - job.startedAt) / 1000;
+    if (job.pagesDone > 0) {
+      const observedPacePerPage = elapsed / job.pagesDone;
+      secondsRemaining = Math.max(0, Math.round(observedPacePerPage * (job.pagesTotal - job.pagesDone)));
+    } else {
+      secondsRemaining = Math.max(0, Math.round(job.estimatedSeconds - elapsed));
+    }
+  }
+
   res.json({
     status: job.status,
     stage: job.stage,
     pages_done: job.pagesDone,
     pages_total: job.pagesTotal,
+    estimated_seconds: job.estimatedSeconds,
+    seconds_remaining: secondsRemaining,
     error: job.error,
   });
 });
