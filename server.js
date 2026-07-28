@@ -12,7 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { buildDocx } from './docxBuilder.js';
 import { ocrPage } from './ocr.js';
 import { analyzeTextLayer, textToParagraphBlocks } from './textExtraction.js';
-import { initDb, pool, FREE_FAST, FREE_PRECISE, FREE_SCAN, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
+import { initDb, pool, FREE_FAST, FREE_EDITABLE, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
 import { verifyGoogleAccessToken, issueSessionToken, requireAuth, identifyQuotaSubject } from './auth.js';
 import { createCheckoutSession, createCustomerPortalSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
 
@@ -47,15 +47,16 @@ async function resolveQuotaUser(req) {
 // Formats the three independent quota buckets consistently for every
 // endpoint that reports status — fast is soft-capped against abuse rather
 // than a real product limit, so it's reported but never blocks conversion.
+// Formats the two quota buckets consistently for every endpoint that
+// reports status — Non-editable (fast) is a real but generous cap;
+// Editable is the one that costs real API money and is checked strictly.
 function quotaSummary(user) {
   return {
     plan: user.plan,
     fast_limit: user.fast_limit,
     fast_used: user.fast_used,
-    precise_limit: user.precise_limit,
-    precise_used: user.precise_used,
-    scan_limit: user.scan_limit,
-    scan_used: user.scan_used,
+    editable_limit: user.editable_limit,
+    editable_used: user.editable_used,
   };
 }
 
@@ -90,8 +91,7 @@ app.get('/quota', identifyQuotaSubject, async (req, res) => {
     if (!pool) return res.json({
       signed_in: !!req.userEmail, plan: 'free',
       fast_limit: FREE_FAST, fast_used: 0,
-      precise_limit: FREE_PRECISE, precise_used: 0,
-      scan_limit: FREE_SCAN, scan_used: 0, tracked: false,
+      editable_limit: FREE_EDITABLE, editable_used: 0, tracked: false,
     });
     return res.status(404).json({ error: 'User not found' });
   }
@@ -450,57 +450,51 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
     // The user picks ONE mode for the whole conversion (fast/precise/scan) —
     // no automatic per-page routing anymore. Each page still gets classified
     // (scanned? complex layout?) so we know whether THIS mode can actually
-    // turn it into real editable text, or whether it must fall back to an
-    // embedded page image instead — see the routing table in server comments.
-    const chosenMode = ['fast', 'precise', 'scan'].includes(req.body.mode) ? req.body.mode : 'precise';
+    // The user picks ONE of two modes for the whole conversion:
+    // 'image'    — every page becomes a non-editable picture, no Claude call ever.
+    // 'editable' — every page becomes real editable text; auto-detected per
+    //              page whether that needs free direct extraction, Claude
+    //              vision, or Claude+OCR — the user never sees that split,
+    //              they only chose "I want this editable."
+    const chosenMode = req.body.mode === 'image' ? 'image' : 'editable';
 
-    const pageOutcomes = {}; // i -> { action: 'fast-text'|'precise'|'scan'|'image', billTo: 'fast'|'precise'|'scan' }
+    const pageOutcomes = {}; // i -> { action: 'image'|'fast-text'|'claude', billTo: 'fast'|'editable'|null }
     for (const i of indices) {
       const pageNumber = i + 1;
-      const scanned = await isScannedPage(pdfPath, pageNumber);
 
-      if (chosenMode === 'scan') {
-        // Scan mode always does the full OCR+vision treatment, on every
-        // page — that's the point of deliberately picking it.
-        pageOutcomes[i] = { action: 'scan', billTo: 'scan' };
-      } else if (chosenMode === 'precise') {
-        if (scanned) {
-          // Precise mode isn't built for scans (no OCR grounding) — rather
-          // than guess at lower confidence, embed the page as a picture.
-          // No Claude call happens, so it doesn't cost Precise quota.
-          pageOutcomes[i] = { action: 'image', billTo: 'fast' };
-        } else {
-          pageOutcomes[i] = { action: 'precise', billTo: 'precise' };
-        }
+      if (chosenMode === 'image') {
+        // Non-editable mode: always a picture, regardless of content —
+        // that's the whole point of picking it, and it's cheap either way.
+        pageOutcomes[i] = { action: 'image', billTo: 'fast' };
+        continue;
+      }
+
+      // Editable mode: auto-detect the cheapest way to get real text.
+      const scanned = await isScannedPage(pdfPath, pageNumber);
+      if (scanned) {
+        pageOutcomes[i] = { action: 'claude-scan', billTo: 'editable' };
       } else {
-        // Fast mode: real text only for genuinely simple pages. Anything
-        // scanned or with real layout complexity becomes an embedded image
-        // instead of a garbled text attempt — still billed to Fast, since
-        // no Claude call happens either way.
-        if (scanned) {
-          pageOutcomes[i] = { action: 'image', billTo: 'fast' };
-        } else {
-          const layer = await analyzeTextLayer(pdfPath, pageNumber);
-          pageOutcomes[i] = layer.simple ? { action: 'fast-text', billTo: 'fast' } : { action: 'image', billTo: 'fast' };
-        }
+        const layer = await analyzeTextLayer(pdfPath, pageNumber);
+        // Genuinely simple pages are free (direct extraction) — not billed
+        // to ANY quota bucket, since they cost us nothing either.
+        pageOutcomes[i] = layer.simple
+          ? { action: 'fast-text', billTo: null }
+          : { action: 'claude', billTo: 'editable' };
       }
     }
 
     const fastNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'fast').length;
-    const preciseNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'precise').length;
-    const scanNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'scan').length;
+    const editableNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'editable').length;
 
     if (user) {
       const fastRemaining = user.fast_limit - user.fast_used;
-      const preciseRemaining = user.precise_limit - user.precise_used;
-      const scanRemaining = user.scan_limit - user.scan_used;
-      if (fastNeeded > fastRemaining || preciseNeeded > preciseRemaining || scanNeeded > scanRemaining) {
+      const editableRemaining = user.editable_limit - user.editable_used;
+      if (fastNeeded > fastRemaining || editableNeeded > editableRemaining) {
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         return res.status(402).json({
           error: 'quota_exceeded',
           fast_needed: fastNeeded, fast_remaining: Math.max(fastRemaining, 0),
-          precise_needed: preciseNeeded, precise_remaining: Math.max(preciseRemaining, 0),
-          scan_needed: scanNeeded, scan_remaining: Math.max(scanRemaining, 0),
+          editable_needed: editableNeeded, editable_remaining: Math.max(editableRemaining, 0),
           ...quotaSummary(user),
         });
       }
@@ -514,7 +508,7 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
       pagesTotal: indices.length,
       resultBuffer: null,
       pagesConverted: indices.length,
-      modeCounts: { fast: fastNeeded, precise: preciseNeeded, scan: scanNeeded },
+      modeCounts: { fast: fastNeeded, editable: editableNeeded },
       error: null,
       createdAt: Date.now(),
     });
@@ -543,9 +537,7 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
       const { action } = pageOutcomes[i];
 
       if (action === 'image') {
-        // Honest fallback: this page can't become real editable text in the
-        // mode the user picked, so it's embedded as a picture instead of a
-        // garbled or low-confidence text attempt.
+        // Non-editable mode — embed the page as-is, no Claude call.
         pageResults.push({ pageNumber, wholePageImage: pageImages[i], blocks: [], images: [] });
         job.pagesDone += 1;
         continue;
@@ -560,7 +552,7 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
       }
 
       let ocrText = null;
-      if (action === 'scan') {
+      if (action === 'claude-scan') {
         try {
           const ocrResult = await ocrPage(pageImagePaths[i]);
           ocrText = ocrResult.rawText;
@@ -580,10 +572,9 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
     job.stage = 'building';
     const { buffer: docxBuffer, stats } = await buildDocx(pageResults);
     if (user) {
-      const { fast, precise, scan } = job.modeCounts;
+      const { fast, editable } = job.modeCounts;
       if (fast) await incrementUsageById(user.id, 'fast', fast);
-      if (precise) await incrementUsageById(user.id, 'precise', precise);
-      if (scan) await incrementUsageById(user.id, 'scan', scan);
+      if (editable) await incrementUsageById(user.id, 'editable', editable);
     }
 
     job.resultBuffer = docxBuffer;
