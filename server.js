@@ -11,7 +11,8 @@ import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
 import { buildDocx } from './docxBuilder.js';
 import { ocrPage } from './ocr.js';
-import { initDb, pool, FREE_PAGES, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
+import { analyzeTextLayer, textToParagraphBlocks } from './textExtraction.js';
+import { initDb, pool, FREE_PRECISE, FREE_SCAN, FAST_DAILY_SOFT_CAP, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
 import { verifyGoogleAccessToken, issueSessionToken, requireAuth, identifyQuotaSubject } from './auth.js';
 import { createCheckoutSession, createCustomerPortalSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
 
@@ -43,6 +44,20 @@ async function resolveQuotaUser(req) {
   return null;
 }
 
+// Formats the three independent quota buckets consistently for every
+// endpoint that reports status — fast is soft-capped against abuse rather
+// than a real product limit, so it's reported but never blocks conversion.
+function quotaSummary(user) {
+  return {
+    plan: user.plan,
+    precise_limit: user.precise_limit,
+    precise_used: user.precise_used,
+    scan_limit: user.scan_limit,
+    scan_used: user.scan_used,
+    fast_used: user.fast_used,
+  };
+}
+
 // ---------- Auth ----------
 // Called only when the person actually starts a payment (hidden behind the
 // "Оплатить" button) — never a separate, visible sign-in step.
@@ -53,7 +68,7 @@ app.post('/auth/google', express.json(), async (req, res) => {
     const { email, sub } = await verifyGoogleAccessToken(access_token);
     const user = await findOrCreateUserFromGoogle({ email, googleSub: sub, anonId: anonymous_id });
     const token = issueSessionToken(email);
-    res.json({ token, email: user.email, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
+    res.json({ token, email: user.email, ...quotaSummary(user) });
   } catch (err) {
     console.error('auth/google error', err);
     res.status(401).json({ error: 'Google sign-in failed' });
@@ -63,18 +78,22 @@ app.post('/auth/google', express.json(), async (req, res) => {
 app.get('/me', requireAuth, async (req, res) => {
   const user = await getUserByEmail(req.userEmail);
   if (!user) return res.status(404).json({ error: 'User not found' });
-  res.json({ email: user.email, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
+  res.json({ email: user.email, ...quotaSummary(user) });
 });
 
 // Lightweight quota check for BOTH signed-in and anonymous free-tier users —
-// used to show the "N / M free" pill and to decide whether to show the paywall.
+// used to show the usage pill and to decide whether to show the paywall.
 app.get('/quota', identifyQuotaSubject, async (req, res) => {
   const user = await resolveQuotaUser(req);
   if (!user) {
-    if (!pool) return res.json({ signed_in: !!req.userEmail, plan: 'free', pages_limit: FREE_PAGES, pages_used: 0, tracked: false });
+    if (!pool) return res.json({
+      signed_in: !!req.userEmail, plan: 'free',
+      precise_limit: FREE_PRECISE, precise_used: 0,
+      scan_limit: FREE_SCAN, scan_used: 0, fast_used: 0, tracked: false,
+    });
     return res.status(404).json({ error: 'User not found' });
   }
-  res.json({ signed_in: !!req.userEmail, plan: user.plan, pages_limit: user.pages_limit, pages_used: user.pages_used });
+  res.json({ signed_in: !!req.userEmail, ...quotaSummary(user) });
 });
 
 // ---------- Billing ----------
@@ -401,6 +420,7 @@ function cleanupOldJobs() {
 setInterval(cleanupOldJobs, 5 * 60 * 1000).unref();
 
 app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (req, res) => {
+  let tmpDir;
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     if (!process.env.ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY not configured on server' });
@@ -408,7 +428,7 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
     const user = await resolveQuotaUser(req);
     if (!user && pool) return res.status(404).json({ error: 'User not found' });
 
-    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf2word-'));
     const pdfPath = path.join(tmpDir, 'input.pdf');
     await fs.writeFile(pdfPath, req.file.buffer);
 
@@ -425,16 +445,34 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
       if (filtered.length) indices = filtered;
     }
 
+    // Classify every selected page as fast/precise/scan UP FRONT (cheap —
+    // just pdftotext checks, no Claude call) so quota can be checked per
+    // bucket before any money is spent, instead of failing mid-job.
+    const pageModes = {};
+    for (const i of indices) {
+      const pageNumber = i + 1;
+      const scanned = await isScannedPage(pdfPath, pageNumber);
+      if (scanned) {
+        pageModes[i] = 'scan';
+        continue;
+      }
+      const layer = await analyzeTextLayer(pdfPath, pageNumber);
+      pageModes[i] = layer.simple ? 'fast' : 'precise';
+    }
+    const preciseNeeded = Object.values(pageModes).filter(m => m === 'precise').length;
+    const scanNeeded = Object.values(pageModes).filter(m => m === 'scan').length;
+    const fastNeeded = Object.values(pageModes).filter(m => m === 'fast').length;
+
     if (user) {
-      const remaining = user.pages_limit - user.pages_used;
-      if (indices.length > remaining) {
+      const preciseRemaining = user.precise_limit - user.precise_used;
+      const scanRemaining = user.scan_limit - user.scan_used;
+      if (preciseNeeded > preciseRemaining || scanNeeded > scanRemaining) {
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         return res.status(402).json({
           error: 'quota_exceeded',
-          message: `Недостаточно страниц в лимите: нужно ${indices.length}, осталось ${Math.max(remaining, 0)}`,
-          pages_needed: indices.length,
-          pages_limit: user.pages_limit,
-          pages_used: user.pages_used,
+          precise_needed: preciseNeeded, precise_remaining: Math.max(preciseRemaining, 0),
+          scan_needed: scanNeeded, scan_remaining: Math.max(scanRemaining, 0),
+          ...quotaSummary(user),
         });
       }
     }
@@ -447,47 +485,44 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
       pagesTotal: indices.length,
       resultBuffer: null,
       pagesConverted: indices.length,
+      modeCounts: { fast: fastNeeded, precise: preciseNeeded, scan: scanNeeded },
       error: null,
       createdAt: Date.now(),
     });
     res.json({ job_id: jobId, pages_total: indices.length });
 
     // Runs after the response is already sent — the client polls /convert/progress.
-    runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, user, userEmail: req.userEmail }).catch(err => {
+    runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageModes, user, userEmail: req.userEmail }).catch(err => {
       console.error('conversion job failed', err);
       const job = jobs.get(jobId);
       if (job) { job.status = 'error'; job.error = err.message || 'Conversion failed'; }
     });
   } catch (err) {
     console.error(err);
+    if (tmpDir) await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
     res.status(500).json({ error: err.message || 'Could not start conversion' });
   }
 });
 
-async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, user, userEmail }) {
+async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageModes, user, userEmail }) {
   const job = jobs.get(jobId);
   try {
     const pageResults = [];
     for (const i of indices) {
       const pageNumber = i + 1;
       job.stage = 'text';
-      const scanned = await isScannedPage(pdfPath, pageNumber);
+      const mode = pageModes[i];
 
-      if (!scanned) {
-        const layer = await analyzeTextLayer(pdfPath, pageNumber);
-        if (layer.simple) {
-          // Direct extraction — no Claude call at all. Faster, free, and
-          // actually more accurate than the AI path for genuinely plain
-          // text: it's a literal copy, so there's no transcription risk.
-          const images = await extractPageImages(tmpDir, pdfPath, pageNumber);
-          pageResults.push({ pageNumber, blocks: textToParagraphBlocks(layer.text), images });
-          job.pagesDone += 1;
-          continue;
-        }
+      if (mode === 'fast') {
+        const layer = await analyzeTextLayer(pdfPath, pageNumber); // cheap, re-run to get the actual text (not cached from classification pass)
+        const images = await extractPageImages(tmpDir, pdfPath, pageNumber);
+        pageResults.push({ pageNumber, blocks: textToParagraphBlocks(layer.text), images });
+        job.pagesDone += 1;
+        continue;
       }
 
       let ocrText = null;
-      if (scanned) {
+      if (mode === 'scan') {
         try {
           const ocrResult = await ocrPage(pageImagePaths[i]);
           ocrText = ocrResult.rawText;
@@ -506,7 +541,12 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
 
     job.stage = 'building';
     const { buffer: docxBuffer, stats } = await buildDocx(pageResults);
-    if (user) await incrementUsageById(user.id, indices.length);
+    if (user) {
+      const { fast, precise, scan } = job.modeCounts;
+      if (fast) await incrementUsageById(user.id, 'fast', fast);
+      if (precise) await incrementUsageById(user.id, 'precise', precise);
+      if (scan) await incrementUsageById(user.id, 'scan', scan);
+    }
 
     job.resultBuffer = docxBuffer;
     job.stats = stats;

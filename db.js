@@ -18,8 +18,11 @@ export async function initDb() {
       anon_id TEXT UNIQUE,
       google_sub TEXT,
       plan TEXT NOT NULL DEFAULT 'free',
-      pages_limit INTEGER NOT NULL DEFAULT 10,
-      pages_used INTEGER NOT NULL DEFAULT 0,
+      precise_limit INTEGER NOT NULL DEFAULT 3,
+      precise_used INTEGER NOT NULL DEFAULT 0,
+      scan_limit INTEGER NOT NULL DEFAULT 1,
+      scan_used INTEGER NOT NULL DEFAULT 0,
+      fast_used INTEGER NOT NULL DEFAULT 0,
       dodo_customer_id TEXT,
       dodo_subscription_id TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -27,11 +30,27 @@ export async function initDb() {
     );
   `);
 
-  // Migration for tables created by an earlier version of this schema (email NOT
-  // NULL, no anon_id) — CREATE TABLE IF NOT EXISTS above is a no-op on those, so
-  // bring them up to date explicitly. Every statement here is safe to re-run.
+  // Migrations — every statement here is safe to re-run, for both brand-new
+  // tables and ones created by an earlier schema version (single combined
+  // pages_limit/pages_used instead of three separate per-mode buckets).
   await pool.query(`ALTER TABLE users ALTER COLUMN email DROP NOT NULL;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS anon_id TEXT;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS precise_limit INTEGER NOT NULL DEFAULT 3;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS precise_used INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_limit INTEGER NOT NULL DEFAULT 1;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scan_used INTEGER NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS fast_used INTEGER NOT NULL DEFAULT 0;`);
+  // Best-effort carry-over from the old single-bucket schema, if present — treat
+  // prior combined usage as "precise" usage so nobody's history is silently lost.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='pages_used')
+         AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='users' AND column_name='pages_limit') THEN
+        UPDATE users SET precise_used = pages_used, precise_limit = GREATEST(pages_limit, 3) WHERE precise_used = 0 AND pages_used > 0;
+      END IF;
+    END $$;
+  `);
   await pool.query(`
     DO $$
     BEGIN
@@ -54,14 +73,18 @@ export async function initDb() {
   `);
 }
 
-// Plan catalog — pages_limit here is what a webhook applies once a plan becomes active.
-// FREE_PAGES is the one-time lifetime allotment for a new anonymous device/browser
-// (not a monthly reset) — no sign-in required to use it.
-export const FREE_PAGES = 10;
+// Free tier (no sign-in): a few trial pages for Precise and Scan so people
+// can judge quality before paying, plus unlimited Fast (soft rate-limited
+// server-side against scripted abuse — see FAST_DAILY_SOFT_CAP below).
+export const FREE_PRECISE = 3;
+export const FREE_SCAN = 1;
+export const FAST_DAILY_SOFT_CAP = 500; // abuse guard only, not a real product limit
+
+// Launch prices — matching real prices actually charged from day one, so any
+// later strikethrough discount is a legitimate former price, not a fabricated one.
 export const PLANS = {
-  plan_5:  { pages: 50,  priceLabel: '$5 / 50 стр' },
-  plan_10: { pages: 120, priceLabel: '$10 / 120 стр' },
-  plan_15: { pages: 200, priceLabel: '$15 / 200 стр' },
+  plan_20:  { precise: 100,  scan: 30,  priceLabel: '$20 / mo' },
+  plan_120: { precise: 1000, scan: 200, priceLabel: '$120 / mo' },
 };
 
 // The free tier is anonymous — identified by a random ID the extension
@@ -70,8 +93,8 @@ export async function findOrCreateAnonUser(anonId) {
   const existing = await pool.query('SELECT * FROM users WHERE anon_id = $1', [anonId]);
   if (existing.rows.length) return existing.rows[0];
   const inserted = await pool.query(
-    `INSERT INTO users (anon_id, plan, pages_limit, pages_used) VALUES ($1,'free',$2,0) RETURNING *`,
-    [anonId, FREE_PAGES]
+    `INSERT INTO users (anon_id, plan, precise_limit, scan_limit) VALUES ($1,'free',$2,$3) RETURNING *`,
+    [anonId, FREE_PRECISE, FREE_SCAN]
   );
   return inserted.rows[0];
 }
@@ -81,37 +104,46 @@ export async function getUserByEmail(email) {
   return res.rows[0] || null;
 }
 
-// Called on Google sign-in. If the person already used some/all of their
-// anonymous free pages, that usage is carried over to their account instead
-// of resetting — signing in should never grant a second free allotment.
+// Called on Google sign-in. If the person already used some of their
+// anonymous free trial pages, that usage carries over instead of resetting —
+// signing in should never grant a second free allotment.
 export async function findOrCreateUserFromGoogle({ email, googleSub, anonId }) {
   let user = await getUserByEmail(email);
 
   if (!user) {
-    let pagesUsedToCarry = 0;
+    let preciseUsedToCarry = 0, scanUsedToCarry = 0, fastUsedToCarry = 0;
     let anonRow = null;
     if (anonId) {
       const res = await pool.query('SELECT * FROM users WHERE anon_id = $1', [anonId]);
       anonRow = res.rows[0] || null;
-      if (anonRow) pagesUsedToCarry = anonRow.pages_used;
+      if (anonRow) {
+        preciseUsedToCarry = anonRow.precise_used;
+        scanUsedToCarry = anonRow.scan_used;
+        fastUsedToCarry = anonRow.fast_used;
+      }
     }
     const inserted = await pool.query(
-      `INSERT INTO users (email, google_sub, plan, pages_limit, pages_used) VALUES ($1,$2,'free',$3,$4) RETURNING *`,
-      [email, googleSub || null, FREE_PAGES, Math.min(pagesUsedToCarry, FREE_PAGES)]
+      `INSERT INTO users (email, google_sub, plan, precise_limit, precise_used, scan_limit, scan_used, fast_used)
+       VALUES ($1,$2,'free',$3,$4,$5,$6,$7) RETURNING *`,
+      [email, googleSub || null, FREE_PRECISE, Math.min(preciseUsedToCarry, FREE_PRECISE),
+       FREE_SCAN, Math.min(scanUsedToCarry, FREE_SCAN), fastUsedToCarry]
     );
     if (anonRow) await pool.query('DELETE FROM users WHERE id = $1', [anonRow.id]);
     return inserted.rows[0];
   }
 
-  // Existing account signing in again from a browser that also has anonymous usage
-  // on this plan (e.g. used some free pages before, signed in later) — merge it in once.
   if (anonId) {
     const res = await pool.query('SELECT * FROM users WHERE anon_id = $1', [anonId]);
     const anonRow = res.rows[0];
     if (anonRow) {
       await pool.query(
-        'UPDATE users SET pages_used = LEAST(pages_used + $2, pages_limit), updated_at = now() WHERE id = $1',
-        [user.id, anonRow.pages_used]
+        `UPDATE users SET
+           precise_used = LEAST(precise_used + $2, precise_limit),
+           scan_used = LEAST(scan_used + $3, scan_limit),
+           fast_used = fast_used + $4,
+           updated_at = now()
+         WHERE id = $1`,
+        [user.id, anonRow.precise_used, anonRow.scan_used, anonRow.fast_used]
       );
       await pool.query('DELETE FROM users WHERE id = $1', [anonRow.id]);
       user = await getUserByEmail(email);
@@ -120,8 +152,11 @@ export async function findOrCreateUserFromGoogle({ email, googleSub, anonId }) {
   return user;
 }
 
-export async function incrementUsageById(id, pages) {
-  await pool.query('UPDATE users SET pages_used = pages_used + $2, updated_at = now() WHERE id = $1', [id, pages]);
+// mode is 'fast' | 'precise' | 'scan' — each page counts against exactly one
+// bucket, decided automatically by the conversion pipeline, not chosen by the user.
+export async function incrementUsageById(id, mode, pages) {
+  const column = mode === 'scan' ? 'scan_used' : mode === 'precise' ? 'precise_used' : 'fast_used';
+  await pool.query(`UPDATE users SET ${column} = ${column} + $2, updated_at = now() WHERE id = $1`, [id, pages]);
 }
 
 export async function setDodoCustomerId(email, dodoCustomerId) {
@@ -133,16 +168,18 @@ export async function activatePlan({ email, dodoCustomerId, dodoSubscriptionId, 
   const plan = PLANS[planKey];
   if (!plan) throw new Error(`Unknown plan key: ${planKey}`);
   await pool.query(
-    `UPDATE users SET plan = $2, pages_limit = $3, pages_used = 0, dodo_customer_id = $4, dodo_subscription_id = $5, updated_at = now()
+    `UPDATE users SET plan = $2, precise_limit = $3, precise_used = 0, scan_limit = $4, scan_used = 0,
+       fast_used = 0, dodo_customer_id = $5, dodo_subscription_id = $6, updated_at = now()
      WHERE email = $1`,
-    [email, planKey, plan.pages, dodoCustomerId, dodoSubscriptionId]
+    [email, planKey, plan.precise, plan.scan, dodoCustomerId, dodoSubscriptionId]
   );
 }
 
 export async function deactivatePlan(email) {
   await pool.query(
-    `UPDATE users SET plan = 'free', pages_limit = $2, pages_used = 0, updated_at = now() WHERE email = $1`,
-    [email, FREE_PAGES]
+    `UPDATE users SET plan = 'free', precise_limit = $2, precise_used = 0, scan_limit = $3, scan_used = 0, updated_at = now()
+     WHERE email = $1`,
+    [email, FREE_PRECISE, FREE_SCAN]
   );
 }
 

@@ -32,9 +32,8 @@ function getWebhookVerifier() {
 // Maps our internal plan keys to the product IDs you create in the Dodo dashboard.
 // Set these as env vars once you've created the three subscription products there.
 const PRODUCT_ID_BY_PLAN = {
-  plan_5: process.env.DODO_PRODUCT_ID_5,
-  plan_10: process.env.DODO_PRODUCT_ID_10,
-  plan_15: process.env.DODO_PRODUCT_ID_15,
+  plan_20: process.env.DODO_PRODUCT_ID_20,
+  plan_120: process.env.DODO_PRODUCT_ID_120,
 };
 
 export async function createCheckoutSession({ email, planKey, returnUrl }) {
