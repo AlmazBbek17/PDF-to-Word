@@ -386,7 +386,7 @@ async function parsePageWithClaude(imageBuffer, ocrText) {
   }
   const msg = await anthropic.messages.create({
     model: MODEL,
-    max_tokens: 4096,
+    max_tokens: 8192, // was 4096 — too easy to truncate mid-response on pages with several tables/formulas, which corrupts the JSON and silently drops the page's content
     messages: [{
       role: 'user',
       content: [
@@ -399,8 +399,25 @@ async function parsePageWithClaude(imageBuffer, ocrText) {
   const cleaned = text.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
   try {
     return JSON.parse(cleaned);
-  } catch {
-    return { blocks: [{ type: 'paragraph', text: '[Не удалось разобрать страницу]' }] };
+  } catch (err) {
+    // Most common real cause: a "latex" field contains a LaTeX command like
+    // \frac or \sigma with a single backslash — valid LaTeX, but invalid
+    // inside a JSON string (which requires \\frac to mean a literal
+    // backslash). Try a targeted repair before giving up on the whole page.
+    try {
+      const repaired = cleaned
+        .replace(/\\(?!["\\/bfnrtu]|u[0-9a-fA-F]{4})/g, '\\\\')
+        // \frac, \tau, \beta, \nabla, \rho etc. start with a letter JSON
+        // treats as a valid single-char escape (\f \t \b \n \r) — the first
+        // pass leaves those alone. This second pass catches them by noticing
+        // a real control-character escape is never followed by more letters.
+        .replace(/\\([bfnrtu])(?=[a-zA-Z])/g, '\\\\$1');
+      return JSON.parse(repaired);
+    } catch (err2) {
+      console.error('Failed to parse Claude JSON response for a page:', err2.message);
+      console.error('Raw response (first 2000 chars):', cleaned.slice(0, 2000));
+      return { blocks: [{ type: 'paragraph', text: '[Не удалось разобрать страницу]' }] };
+    }
   }
 }
 
