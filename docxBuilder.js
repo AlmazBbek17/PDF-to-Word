@@ -45,6 +45,36 @@ function imageParagraph(buffer) {
   });
 }
 
+const PAGE_IMG_WIDTH = 640; // px — near full page width, unlike the small inline-photo box above
+
+// Embeds the whole rendered page as one picture — used when a mode can't (or
+// isn't meant to) turn this page into real editable text. Honest tradeoff:
+// the content is visually preserved but not editable, rather than silently
+// producing a garbled or low-confidence text attempt.
+function wholePageImageBlock(buffer) {
+  let width = PAGE_IMG_WIDTH, height = PAGE_IMG_WIDTH * 1.3;
+  try {
+    const dim = sizeOf(buffer);
+    if (dim.width && dim.height) {
+      width = Math.min(PAGE_IMG_WIDTH, dim.width);
+      height = Math.round(width * (dim.height / dim.width));
+    }
+  } catch { /* fall back to default box if dimensions can't be read */ }
+
+  return [
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { before: 80, after: 40 },
+      children: [ new ImageRun({ type: 'jpg', data: buffer, transformation: { width, height } }) ]
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      spacing: { after: 200 },
+      children: [ new TextRun({ text: 'Изображение страницы — не редактируется', italics: true, size: 16, color: '888888' }) ]
+    }),
+  ];
+}
+
 // Splits text on {{...}} markers and returns an array of TextRun,
 // highlighting the marked (low-confidence) fragments. Also tallies word
 // counts into `stats` so the caller can report a real confidence percentage
@@ -142,11 +172,17 @@ export async function buildDocx(pageResults) {
   const stats = { totalWords: 0, flaggedWords: 0, flaggedCount: 0 };
   const children = [];
   pageResults.forEach((page, idx) => {
-    for (const block of page.blocks) {
-      children.push(...blockToParagraphs(block, stats));
-    }
-    for (const imgBuf of (page.images || [])) {
-      children.push(imageParagraph(imgBuf));
+    if (page.wholePageImage) {
+      // This page couldn't (or wasn't meant to) become real editable text in
+      // the mode the user picked — embed it as-is instead of guessing.
+      children.push(...wholePageImageBlock(page.wholePageImage));
+    } else {
+      for (const block of page.blocks) {
+        children.push(...blockToParagraphs(block, stats));
+      }
+      for (const imgBuf of (page.images || [])) {
+        children.push(imageParagraph(imgBuf));
+      }
     }
     if (idx < pageResults.length - 1) {
       // Tagged with a named style (not just a bare page break) so the frontend

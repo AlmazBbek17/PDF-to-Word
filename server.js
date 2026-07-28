@@ -12,7 +12,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { buildDocx } from './docxBuilder.js';
 import { ocrPage } from './ocr.js';
 import { analyzeTextLayer, textToParagraphBlocks } from './textExtraction.js';
-import { initDb, pool, FREE_PRECISE, FREE_SCAN, FAST_DAILY_SOFT_CAP, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
+import { initDb, pool, FREE_FAST, FREE_PRECISE, FREE_SCAN, findOrCreateAnonUser, findOrCreateUserFromGoogle, getUserByEmail, incrementUsageById } from './db.js';
 import { verifyGoogleAccessToken, issueSessionToken, requireAuth, identifyQuotaSubject } from './auth.js';
 import { createCheckoutSession, createCustomerPortalSession, verifyAndParseWebhook, handleDodoEvent } from './billing.js';
 
@@ -50,11 +50,12 @@ async function resolveQuotaUser(req) {
 function quotaSummary(user) {
   return {
     plan: user.plan,
+    fast_limit: user.fast_limit,
+    fast_used: user.fast_used,
     precise_limit: user.precise_limit,
     precise_used: user.precise_used,
     scan_limit: user.scan_limit,
     scan_used: user.scan_used,
-    fast_used: user.fast_used,
   };
 }
 
@@ -88,8 +89,9 @@ app.get('/quota', identifyQuotaSubject, async (req, res) => {
   if (!user) {
     if (!pool) return res.json({
       signed_in: !!req.userEmail, plan: 'free',
+      fast_limit: FREE_FAST, fast_used: 0,
       precise_limit: FREE_PRECISE, precise_used: 0,
-      scan_limit: FREE_SCAN, scan_used: 0, fast_used: 0, tracked: false,
+      scan_limit: FREE_SCAN, scan_used: 0, tracked: false,
     });
     return res.status(404).json({ error: 'User not found' });
   }
@@ -445,31 +447,58 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
       if (filtered.length) indices = filtered;
     }
 
-    // Classify every selected page as fast/precise/scan UP FRONT (cheap —
-    // just pdftotext checks, no Claude call) so quota can be checked per
-    // bucket before any money is spent, instead of failing mid-job.
-    const pageModes = {};
+    // The user picks ONE mode for the whole conversion (fast/precise/scan) —
+    // no automatic per-page routing anymore. Each page still gets classified
+    // (scanned? complex layout?) so we know whether THIS mode can actually
+    // turn it into real editable text, or whether it must fall back to an
+    // embedded page image instead — see the routing table in server comments.
+    const chosenMode = ['fast', 'precise', 'scan'].includes(req.body.mode) ? req.body.mode : 'precise';
+
+    const pageOutcomes = {}; // i -> { action: 'fast-text'|'precise'|'scan'|'image', billTo: 'fast'|'precise'|'scan' }
     for (const i of indices) {
       const pageNumber = i + 1;
       const scanned = await isScannedPage(pdfPath, pageNumber);
-      if (scanned) {
-        pageModes[i] = 'scan';
-        continue;
+
+      if (chosenMode === 'scan') {
+        // Scan mode always does the full OCR+vision treatment, on every
+        // page — that's the point of deliberately picking it.
+        pageOutcomes[i] = { action: 'scan', billTo: 'scan' };
+      } else if (chosenMode === 'precise') {
+        if (scanned) {
+          // Precise mode isn't built for scans (no OCR grounding) — rather
+          // than guess at lower confidence, embed the page as a picture.
+          // No Claude call happens, so it doesn't cost Precise quota.
+          pageOutcomes[i] = { action: 'image', billTo: 'fast' };
+        } else {
+          pageOutcomes[i] = { action: 'precise', billTo: 'precise' };
+        }
+      } else {
+        // Fast mode: real text only for genuinely simple pages. Anything
+        // scanned or with real layout complexity becomes an embedded image
+        // instead of a garbled text attempt — still billed to Fast, since
+        // no Claude call happens either way.
+        if (scanned) {
+          pageOutcomes[i] = { action: 'image', billTo: 'fast' };
+        } else {
+          const layer = await analyzeTextLayer(pdfPath, pageNumber);
+          pageOutcomes[i] = layer.simple ? { action: 'fast-text', billTo: 'fast' } : { action: 'image', billTo: 'fast' };
+        }
       }
-      const layer = await analyzeTextLayer(pdfPath, pageNumber);
-      pageModes[i] = layer.simple ? 'fast' : 'precise';
     }
-    const preciseNeeded = Object.values(pageModes).filter(m => m === 'precise').length;
-    const scanNeeded = Object.values(pageModes).filter(m => m === 'scan').length;
-    const fastNeeded = Object.values(pageModes).filter(m => m === 'fast').length;
+
+    const fastNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'fast').length;
+    const preciseNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'precise').length;
+    const scanNeeded = Object.values(pageOutcomes).filter(o => o.billTo === 'scan').length;
 
     if (user) {
+      const fastRemaining = user.fast_limit - user.fast_used;
       const preciseRemaining = user.precise_limit - user.precise_used;
       const scanRemaining = user.scan_limit - user.scan_used;
-      if (preciseNeeded > preciseRemaining || scanNeeded > scanRemaining) {
+      if (fastNeeded > fastRemaining || preciseNeeded > preciseRemaining || scanNeeded > scanRemaining) {
         await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
         return res.status(402).json({
           error: 'quota_exceeded',
+          fast_needed: fastNeeded, fast_remaining: Math.max(fastRemaining, 0),
           precise_needed: preciseNeeded, precise_remaining: Math.max(preciseRemaining, 0),
           scan_needed: scanNeeded, scan_remaining: Math.max(scanRemaining, 0),
           ...quotaSummary(user),
@@ -492,7 +521,7 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
     res.json({ job_id: jobId, pages_total: indices.length });
 
     // Runs after the response is already sent — the client polls /convert/progress.
-    runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageModes, user, userEmail: req.userEmail }).catch(err => {
+    runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageOutcomes, user, userEmail: req.userEmail }).catch(err => {
       console.error('conversion job failed', err);
       const job = jobs.get(jobId);
       if (job) { job.status = 'error'; job.error = err.message || 'Conversion failed'; }
@@ -504,16 +533,25 @@ app.post('/convert/start', identifyQuotaSubject, upload.single('file'), async (r
   }
 });
 
-async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageModes, user, userEmail }) {
+async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImagePaths, indices, pageOutcomes, user, userEmail }) {
   const job = jobs.get(jobId);
   try {
     const pageResults = [];
     for (const i of indices) {
       const pageNumber = i + 1;
       job.stage = 'text';
-      const mode = pageModes[i];
+      const { action } = pageOutcomes[i];
 
-      if (mode === 'fast') {
+      if (action === 'image') {
+        // Honest fallback: this page can't become real editable text in the
+        // mode the user picked, so it's embedded as a picture instead of a
+        // garbled or low-confidence text attempt.
+        pageResults.push({ pageNumber, wholePageImage: pageImages[i], blocks: [], images: [] });
+        job.pagesDone += 1;
+        continue;
+      }
+
+      if (action === 'fast-text') {
         const layer = await analyzeTextLayer(pdfPath, pageNumber); // cheap, re-run to get the actual text (not cached from classification pass)
         const images = await extractPageImages(tmpDir, pdfPath, pageNumber);
         pageResults.push({ pageNumber, blocks: textToParagraphBlocks(layer.text), images });
@@ -522,7 +560,7 @@ async function runConversionJob(jobId, { tmpDir, pdfPath, pageImages, pageImageP
       }
 
       let ocrText = null;
-      if (mode === 'scan') {
+      if (action === 'scan') {
         try {
           const ocrResult = await ocrPage(pageImagePaths[i]);
           ocrText = ocrResult.rawText;
